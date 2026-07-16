@@ -1,6 +1,8 @@
-# Reproduction of dotnet/runtime#121977
+# Startup-profile cache corruption (dotnet/runtime#121977)
 
 MulticoreJIT (ProfileOptimization) startup-profile cache corruption under concurrent writers.
+
+This reproduction and its analysis were prepared with AI assistance.
 
 ## Root cause
 
@@ -27,16 +29,74 @@ producing any output.
 So the **corruption itself is a Unix manifestation**. On Windows the deny-share open
 prevents torn reads, but turns every in-place write window into a sharing violation for
 readers (and silently drops a second concurrent writer's update). The fix — write to a
-private temp file, publish with an atomic rename / `MoveFileExW` — removes both: the final
-path is never opened for write, so Linux readers never see a torn profile and Windows
-readers are never refused.
+private temp file, publish it with `rename(2)` (atomic by POSIX contract) on Linux and
+`MoveFileExW(MOVEFILE_REPLACE_EXISTING)` on Windows — removes both: the final path is
+never opened for write, so Linux readers never see a torn profile and Windows readers are
+never refused. (The move is same-directory with no `MOVEFILE_COPY_ALLOWED`, so it cannot
+silently degrade to copy+delete; the Windows benefit rests on the final path never being
+write-opened, not on documented `MoveFileExW` atomicity.)
 
-This is why the two harnesses measure different things:
+This is why the two drivers measure different things:
 - **Linux** reproduces the actual defect (torn/incomplete reads) deterministically.
-- **Windows** demonstrates the reader contention (sharing violations) and that the fix
-  eliminates it. It does **not** reproduce a crash — Windows is immune to the torn read.
+- **Windows** demonstrates the reader contention (sharing violations). It does **not**
+  reproduce a crash — Windows is immune to the torn read.
 
-## The method (~40s per run)
+## Reproduce it
+
+To reproduce, you need a **.NET SDK that can target `net11.0`** (a .NET 11
+preview SDK; that is the app's target framework), with `dotnet` on `PATH`. On Linux you also
+need `gcc` (for the single native shim file); Windows needs no native compiler. Clone the
+repository and run the driver for your OS.
+
+**Linux**
+
+```sh
+cd linux
+chmod +x run.sh
+./run.sh
+```
+Expected — the bug reproduces (exit 2; counts below are illustrative, they vary run to run):
+```
+DETECTOR ... samples=2752648 OK=2600664 INCOMPLETE=151984 TORN=0 SHARING_VIOLATION=0 missing=0
+shim: final-path fopen hits=12, delayed fwrites=44852 (0 = the runtime never wrote the final path in place)
+RESULT: NON-ATOMIC -- reader observed an incomplete/torn profile (bug present).
+```
+
+**Windows** (PowerShell 5.1 or 7+)
+
+```powershell
+cd windows
+.\run.ps1
+```
+Expected — reader contention (exit 2): `SHARING_VIOLATION` > 0, `RESULT: CONTENTION`. Windows
+does not show torn reads (deny-share open refuses the concurrent reader instead) — see
+"Platform difference" above.
+
+Tunables: `DUR_MS`/`WRITERS` (Linux env vars), `-DurationMs`/`-Writers` (Windows params).
+The app targets `net11.0` — the runtime whose profile write path is the CRT `fopen`/`fwrite`
+the shim hooks. On an older SDK you can lower `<TargetFramework>` in `app/mcjrepro.csproj`
+(net10/9/8): the in-place corruption still reproduces (INCOMPLETE/TORN from the natural
+window), but the `shim:` hit counts stay 0, because pre-net11 runtimes write the profile
+through a different path.
+
+Any exit code other than `2` (bug) or `0` (clean) is a harness error — no profile written,
+detector never got a valid read — never a verdict.
+
+### Optional: compare against a fixed runtime
+
+To see the same workload come back clean, point `DOTNET_ROOT` at any runtime *layout* (a
+`dotnet` host plus `shared/Microsoft.NETCore.App/<version>/`) — e.g. a locally built coreclr
+assembled per
+[using-your-build-with-installed-sdk.md](https://github.com/dotnet/runtime/blob/main/docs/workflow/testing/using-your-build-with-installed-sdk.md):
+
+```sh
+DOTNET_ROOT=/path/to/a-runtime ./run.sh                             # exit 0: 0 torn reads, 0 shim hits
+```
+```powershell
+$env:DOTNET_ROOT = "C:\path\to\a-runtime"; .\run.ps1                # exit 0: 0 sharing violations
+```
+
+## How it works (~40s per run)
 
 Waiting for the downstream JIT crash is lossy and flaky (reporters see "1 to 300 tries").
 Instead we measure the defect **at its source** — the fix's contract is *"a reader never
@@ -58,18 +118,18 @@ observes a non-atomic intermediate state"*:
   was complete and valid, `3` if it never got a single valid read (a harness error —
   "nothing happened" must not pass as "atomic").
 
-A runtime that writes to a private `*.tmp` file and publishes via an **atomic rename**
+A runtime that writes to a private `*.tmp` file and publishes it with a rename
 never touches the final path mid-write, so it **evades the shim by construction** — and
 the driver prints the proof: each writer reports its shim hit counts (`shim: final-path
 fopen hits=N, delayed fwrites=M`), nonzero on an unpatched runtime, `0` on a fixed one,
 while the detector verdict flips from `NON-ATOMIC` to `ATOMIC` on the same workload.
 
-`Program.cs` reproduces what pwsh does: every process calls
+`app/Program.cs` reproduces what pwsh does: every process calls
 `ProfileOptimization.StartProfile` on the same file. Two *identical* writers don't corrupt
 (interleaving identical bytes yields a valid file), so workers deliberately write profiles
 of **different sizes** (even = tiny, odd = large) to maximize the torn-merge window.
 
-## Layout
+## Files
 
 ```
 app/      Program.cs, mcjrepro.csproj    the repro app (one StartProfile per process), portable
@@ -78,9 +138,9 @@ linux/    mcj_delay.c, run.sh            LD_PRELOAD shim (C) + driver
 windows/  run.ps1                        driver
 ```
 
-Both the app and the detector are portable C#; only the `LD_PRELOAD` shim (which must
-interpose the CRT `fopen`/`fwrite` calls at the loader level) is native C, so `gcc` is
-needed on Linux for that one file. Windows needs no native compiler — just a .NET SDK.
+The app and the detector are portable C#; only the `LD_PRELOAD` shim (which must interpose
+the CRT `fopen`/`fwrite` calls at the loader level) is native C, so `gcc` is needed on
+Linux for that one file. Windows needs no native compiler — just a .NET SDK.
 
 ## What this measures (and what it does not)
 
@@ -96,62 +156,11 @@ truncated or torn profile *being produced*. Two deliberate limits:
   every writer on it is patched. That is the argument for servicing backports, not
   against the fix.
 
-## Run — Linux
-
-Prerequisites: `gcc`, and a .NET SDK (`dotnet` on `PATH`, or set `DOTNET_ROOT` to a
-specific runtime layout such as a locally built coreclr).
-
-```sh
-cd linux
-chmod +x run.sh
-
-# Against a stock runtime -> reproduces the bug (exit 2):
-DOTNET_ROOT=/path/to/stock-runtime ./run.sh
-
-# Against a runtime built with the fix -> atomic (exit 0):
-DOTNET_ROOT=/path/to/fixed-runtime ./run.sh
-```
-
-Expected — unpatched (12 s, 12 writers):
-```
-DETECTOR ... samples=2752648 OK=2600664 INCOMPLETE=151984 TORN=0 SHARING_VIOLATION=0 missing=0
-shim: final-path fopen hits=12, delayed fwrites=44852 (0 = the runtime never wrote the final path in place)
-RESULT: NON-ATOMIC -- reader observed an incomplete/torn profile (bug present).
-```
-Fixed:
-```
-DETECTOR ... samples=2223943 OK=2223943 INCOMPLETE=0 TORN=0 SHARING_VIOLATION=0 missing=0
-shim: final-path fopen hits=0, delayed fwrites=0 (0 = the runtime never wrote the final path in place)
-RESULT: ATOMIC -- reader never observed a non-atomic profile (fixed).
-```
-Any other exit code is a harness error (no profile seeded, detector never got a valid
-read), never a verdict.
-
-## Run — Windows
-
-Prerequisites: a .NET SDK only (the detector is C#, no native compiler needed). PowerShell
-5.1 or 7+.
-
-```powershell
-cd windows
-
-# Against a stock runtime -> shows sharing violations (exit 2):
-.\run.ps1
-
-# Against a runtime built with the fix -> no contention (exit 0):
-$env:DOTNET_ROOT = "C:\path\to\fixed-runtime"; .\run.ps1
-```
-
-Expected — unpatched: `SHARING_VIOLATION` > 0, `RESULT: CONTENTION`.
-Fixed: `SHARING_VIOLATION=0 INCOMPLETE=0 TORN=0`, `RESULT: CLEAN`.
-
-Tunables: `DUR_MS`/`WRITERS` (Linux env vars), `-DurationMs`/`-Writers` (Windows params).
-The app targets `net11.0`; to test net10/net9 change `<TargetFramework>` in `app/mcjrepro.csproj`
-(the host rolls forward via `DOTNET_ROLL_FORWARD=Major`).
-
 ## The actual startup crash (Linux, for the original symptom)
 
-To get the crash from the issue rather than the atomicity measurement: run many of these
+This is the heavy-tailed, non-deterministic path that the harness above deliberately replaces
+with a fast atomicity measurement; it is shown only to connect the repro to the originally
+reported symptom. To get the crash from the issue rather than the atomicity measurement: run many of these
 processes sharing one `$HOME` under a CPU-throttled cgroup (`--cpus=2` / `CPUQuota=200%`)
 on an otherwise idle host. The brief CFS freeze widens the torn-write window enough that a
 starting process replays a corrupt profile and dies with `Stack overflow.` (exit 134) or a

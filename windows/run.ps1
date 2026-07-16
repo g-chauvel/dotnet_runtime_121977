@@ -113,5 +113,6 @@ try {
     exit $rc
 }
 finally {
-    Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+    # Left in place on purpose (a throwaway dir under %TEMP%); delete it yourself when done.
+    Write-Host "work dir left at: $work"
 }

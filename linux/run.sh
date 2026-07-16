@@ -34,7 +34,8 @@ if [ -n "${DOTNET_ROOT:-}" ]; then RUN="$DOTNET_ROOT/dotnet"; else RUN="$SDK"; f
 command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+# Left in place on purpose (a throwaway dir under $TMPDIR); delete it yourself when done.
+trap 'echo "work dir left at: $WORK"' EXIT
 export MCJ_PROFILE_ROOT="$WORK/cache"
 PROFILE="$MCJ_PROFILE_ROOT/$TARGET"
 export DOTNET_MULTILEVEL_LOOKUP=0 DOTNET_NOLOGO=1 DOTNET_CLI_TELEMETRY_OPTOUT=1
