@@ -1,0 +1,3 @@
+# Keep the Linux harness LF regardless of the checkout OS (bash + gcc need LF).
+*.sh text eol=lf
+*.c  text eol=lf

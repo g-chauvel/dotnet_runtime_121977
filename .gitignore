@@ -1,0 +1,5 @@
+# build artifacts — this harness is built into a temp dir by the runners
+bin/
+obj/
+*.so
+*.o

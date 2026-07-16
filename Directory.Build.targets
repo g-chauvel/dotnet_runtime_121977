@@ -1,0 +1,4 @@
+<Project>
+  <!-- Intentionally empty. See Directory.Build.props: keeps the harness self-contained
+       regardless of any MSBuild configuration higher up the directory tree. -->
+</Project>
