@@ -80,18 +80,35 @@ try {
     Write-Host "== live: detector + $Writers concurrent writers for ${DurationMs}ms =="
     $env:SLEEP_MS = "20"
     $detOut = Join-Path $work "det.out"
-    $detArgs = '"{0}" "{1}" {2}' -f $det, $profilePath, $DurationMs
+    $detReady = Join-Path $work "det.ready"
+    $detArgs = '"{0}" "{1}" {2} "{3}"' -f $det, $profilePath, $DurationMs, $detReady
     $detProc = Start-Process -FilePath $run -ArgumentList $detArgs -PassThru -NoNewWindow -RedirectStandardOutput $detOut
+    $readyWait = [System.Diagnostics.Stopwatch]::StartNew()
+    while (-not (Test-Path $detReady) -and -not $detProc.HasExited -and $readyWait.ElapsedMilliseconds -lt 10000) {
+        Start-Sleep -Milliseconds 10
+    }
+    if (-not (Test-Path $detReady)) {
+        if ($detProc.HasExited) { Get-Content $detOut }
+        throw "detector did not become ready -- no verdict"
+    }
+
     # Stopwatch rather than [Environment]::TickCount64, which Windows PowerShell 5.1
     # (.NET Framework) does not have.
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    while ($sw.ElapsedMilliseconds -lt $DurationMs) {
+    $overlapObserved = $false
+    while ($sw.ElapsedMilliseconds -lt $DurationMs -and -not $detProc.HasExited) {
         $procs = @()
         for ($i = 0; $i -lt $Writers; $i++) {
             $wArgs = '"{0}" {1}' -f $app, $i
             $procs += Start-Process -FilePath $run -ArgumentList $wArgs -PassThru -NoNewWindow
         }
         $procs | ForEach-Object { $_.WaitForExit() }
+        if (-not $detProc.HasExited) {
+            $during = Get-Item $profilePath -ErrorAction SilentlyContinue
+            if ($null -ne $during -and ($during.LastWriteTimeUtc -ne $seedStamp -or $during.Length -ne $seeded)) {
+                $overlapObserved = $true
+            }
+        }
     }
     $detProc.WaitForExit()
     Get-Content $detOut
@@ -107,6 +124,11 @@ try {
     }
 
     $rc = $detProc.ExitCode
+    # A failing detector observed contention directly. A clean detector needs an
+    # independent proof that a publication completed before its sampling window ended.
+    if ($rc -eq 0 -and -not $overlapObserved) {
+        throw "no profile publication completed while the detector was running -- no verdict"
+    }
     switch ($rc) {
         0       { Write-Host "RESULT: CLEAN -- reader never blocked, always read a complete profile (fixed)." }
         2       { Write-Host "RESULT: CONTENTION -- reader observed sharing violations / torn profile (unpatched)." }

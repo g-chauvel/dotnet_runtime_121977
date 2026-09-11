@@ -32,11 +32,17 @@ class Detector
 
     static int Main(string[] args)
     {
-        if (args.Length < 2) { Console.Error.WriteLine("usage: detector <path> <durationMs>"); return 1; }
+        if (args.Length < 2) { Console.Error.WriteLine("usage: detector <path> <durationMs> [readyPath]"); return 1; }
         string path = args[0];
         long dur = long.Parse(args[1]);
         byte[] buf = new byte[64];
         long samples = 0, ok = 0, incomplete = 0, torn = 0, sharing = 0, missing = 0, ioErrors = 0;
+
+        // Let the driver start writers only after the detector is initialized. The
+        // ready file is optional so the detector remains convenient to run by hand.
+        if (args.Length >= 3)
+            File.WriteAllText(args[2], string.Empty);
+
         var sw = Stopwatch.StartNew();
         while (sw.ElapsedMilliseconds < dur)
         {

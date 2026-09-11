@@ -117,6 +117,8 @@ observes a non-atomic intermediate state"*:
   Windows, `SHARING_VIOLATION`) observations. Exits `2` if it ever sees one, `0` if every
   read was complete and valid, `1` for an unexpected I/O error, and `3` if it never got
   a single valid read (a harness error — "nothing happened" must not pass as "atomic").
+  The drivers wait for an explicit detector-ready signal before starting writers and
+  accept a clean verdict only when a publication completed while the detector was alive.
 
 A runtime that writes to a private `*.tmp` file and publishes it with a rename
 never touches the final path mid-write, so it **evades the shim by construction** — and

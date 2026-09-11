@@ -61,19 +61,34 @@ echo "seeded: $SEED_SIZE bytes"
 # nothing and "ATOMIC" would be vacuous.
 [ "$SEED_SIZE" -ge 64 ] || { echo "ERROR: no profile was seeded -- nothing to measure"; exit 1; }
 SEED_MTIME=$(stat -c%Y "$PROFILE")
+SEED_STATE=$(stat -c '%i:%s:%y' "$PROFILE")
 
 echo "== sanity: detector on the static (no-writer) profile, must report 0 =="
 "$RUN" "$DET" "$PROFILE" 800
 
 echo "== live: detector + $WRITERS concurrent delayed writers for ${DUR_MS}ms =="
 export MCJ_DELAY_REPORT="$WORK/shim_report"
-"$RUN" "$DET" "$PROFILE" "$DUR_MS" > "$WORK/det.out" 2>&1 &
+READY="$WORK/det.ready"
+"$RUN" "$DET" "$PROFILE" "$DUR_MS" "$READY" > "$WORK/det.out" 2>&1 &
 det=$!
+for ((attempt=0; attempt<1000; attempt++)); do
+    [ -e "$READY" ] && break
+    kill -0 "$det" 2>/dev/null || break
+    sleep 0.01
+done
+if [ ! -e "$READY" ]; then
+    wait "$det" 2>/dev/null || true
+    cat "$WORK/det.out"
+    echo "ERROR: detector did not become ready -- no verdict"
+    exit 1
+fi
+
 # Keep the unit explicit. GNU date truncates %3N to milliseconds, while the
 # uutils date shipped by Ubuntu 26.04 currently emits all nine nanosecond
 # digits for %3N. Comparing epoch nanoseconds works with both implementations.
 end_ns=$(( $(date +%s%N) + DUR_MS * 1000000 ))
-while (( $(date +%s%N) < end_ns )); do
+overlap_observed=0
+while (( $(date +%s%N) < end_ns )) && kill -0 "$det" 2>/dev/null; do
     pids=()
     for ((i=0; i<WRITERS; i++)); do
         LD_PRELOAD="$WORK/mcj_delay.so" MCJ_TARGET="$TARGET" WORKER_IDX=$i SLEEP_MS=20 \
@@ -82,6 +97,12 @@ while (( $(date +%s%N) < end_ns )); do
     # A writer may crash on the unpatched runtime (it replays a torn profile); that is
     # an expected outcome here, not a script error, so do not let it trip 'set -e'.
     for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done
+    if kill -0 "$det" 2>/dev/null; then
+        current_state=$(stat -c '%i:%s:%y' "$PROFILE" 2>/dev/null || true)
+        if [ -n "$current_state" ] && [ "$current_state" != "$SEED_STATE" ]; then
+            overlap_observed=1
+        fi
+    fi
 done
 # The detector exits 2 when it observes torn/incomplete (the control case): capture that
 # code instead of letting 'set -e' abort on it.
@@ -106,7 +127,13 @@ if [ "$(stat -c%Y "$PROFILE" 2>/dev/null || echo 0)" -eq "$SEED_MTIME" ] && \
 fi
 
 case "$rc" in
-    0) echo "RESULT: ATOMIC -- reader never observed a non-atomic profile (fixed)." ;;
+    0)
+        if [ "$overlap_observed" -ne 1 ]; then
+            echo "ERROR: no profile publication completed while the detector was running -- no verdict"
+            exit 1
+        fi
+        echo "RESULT: ATOMIC -- reader never observed a non-atomic profile (fixed)."
+        ;;
     2) echo "RESULT: NON-ATOMIC -- reader observed an incomplete/torn profile (bug present)." ;;
     3) echo "ERROR: detector never managed a single valid read -- no verdict." ;;
     *) echo "ERROR: detector failed (exit $rc) -- no verdict." ;;
