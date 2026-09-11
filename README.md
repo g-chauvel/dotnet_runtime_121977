@@ -32,9 +32,12 @@ readers (and silently drops a second concurrent writer's update). The fix — wr
 private temp file, publish it with `rename(2)` (atomic by POSIX contract) on Linux and
 `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` on Windows — removes both: the final path is
 never opened for write, so Linux readers never see a torn profile and Windows readers are
-never refused. (The move is same-directory with no `MOVEFILE_COPY_ALLOWED`, so it cannot
-silently degrade to copy+delete; the Windows benefit rests on the final path never being
-write-opened, not on documented `MoveFileExW` atomicity.)
+never refused. It also advances the profile format from version 102 to 103: patched
+runtimes reject stale profiles that may already be corrupt, and patched and unpatched
+cohorts do not consume each other's cache entries. (The move is same-directory with no
+`MOVEFILE_COPY_ALLOWED`, so it cannot silently degrade to copy+delete; the Windows benefit
+rests on the final path never being write-opened, not on documented `MoveFileExW`
+atomicity.)
 
 This is why the two drivers measure different things:
 - **Linux** reproduces the actual defect (torn/incomplete reads) deterministically.
@@ -114,12 +117,15 @@ observes a non-atomic intermediate state"*:
   rewrite tears without the shim too (truncate + buffered ~4 KiB flushes of a tens-of-KB
   body); the shim just makes the windows wide enough to be sampled reliably.
 - **`detector/Detector.cs`** — one C# reader loop, shared by both OSes, that opens the
-  shared profile in a tight loop and counts `INCOMPLETE` / `TORN` / `MISSING` (and, on
-  Windows, `SHARING_VIOLATION`) observations. Exits `2` if it ever sees one, `0` if every
-  read was complete and valid, `1` for an unexpected I/O error, and `3` if it never got
-  a single valid read (a harness error — "nothing happened" must not pass as "atomic").
-  The drivers wait for an explicit detector-ready signal before starting writers and
-  accept a clean verdict only when a publication completed while the detector was alive.
+  shared profile in a tight loop and validates the complete record stream: record types,
+  sizes, alignment, module indexes, header counts, and exact end of file. It accepts
+  version 102 from the stock runtime and version 103 from the atomic-publication fix.
+  It counts `INCOMPLETE` / `TORN` / `MISSING` (and, on Windows, `SHARING_VIOLATION`)
+  observations. It exits `2` if it ever sees one, `0` if every read was structurally
+  valid, `1` for an unexpected I/O error, and `3` if it never got a single valid read
+  (a harness error — "nothing happened" must not pass as "atomic"). The drivers wait
+  for an explicit detector-ready signal before starting writers and accept a clean
+  verdict only when a publication completed while the detector was alive.
 
 A runtime that writes to a private `*.tmp` file and publishes it with a rename
 never touches the final path mid-write, so it **evades the shim by construction** — and
@@ -147,17 +153,16 @@ Linux for that one file. Windows needs no native compiler — just a .NET SDK.
 
 ## What this measures (and what it does not)
 
-The harness proves **writer-side atomicity**: with the fix, a reader can never observe a
-truncated or torn profile *being produced*. Two deliberate limits:
+The harness verifies writer-side publication for this implementation: with the fix, a
+reader observes a structurally complete old or new profile instead of an intermediate
+record stream. Two deliberate limits:
 
-- The detector validates the **header only — exactly like the runtime's player** (that
-  blindness is part of the bug). It does not prove that a reader survives a profile with
-  a valid header and a torn body, and it does not exercise the player's replay path.
-- Each run tests **one runtime cohort**. A mixed fleet (one unpatched writer next to
-  patched processes sharing the same profile root) still tears the shared file, and a
-  patched reader will still replay it — writer atomicity protects a machine only once
-  every writer on it is patched. That is the argument for servicing backports, not
-  against the fix.
+- The detector verifies the complete record grammar but not the semantic validity of
+  signatures or metadata. Corruption that happens to form a structurally valid stream
+  may therefore escape it, and the harness does not exercise the player's replay path.
+- Each run tests **one runtime cohort**. The version bump isolates patched and unpatched
+  readers and writers, but an entirely unpatched cohort can still corrupt and consume
+  version-102 profiles until all relevant runtimes receive the servicing fix.
 
 ## The actual startup crash (Linux, for the original symptom)
 

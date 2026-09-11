@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Diagnostics;
 using System.IO;
 
@@ -6,9 +7,10 @@ using System.IO;
 // The fix's contract is "a reader never observes a non-atomic intermediate state", so this
 // measures the defect at its source instead of waiting for the flaky downstream JIT crash.
 // It opens the shared profile in a tight loop and counts:
-//   INCOMPLETE        = file smaller than the 64-byte header (an unpatched runtime truncates
-//                       the shared file then regrows it; a fixed runtime never does).
-//   TORN              = >=64 bytes but header invalid -> a torn merge of two concurrent writers.
+//   INCOMPLETE        = file or read shorter than the 64-byte header (an unpatched runtime
+//                       truncates the shared file then regrows it; a fixed runtime never does).
+//   TORN              = header or complete record stream is structurally invalid, changes size
+//                       while being read, or disagrees with the record counts in the header.
 //   SHARING_VIOLATION = the open was refused while a writer held the file. Windows only: the
 //                       in-place write opens deny-share (_wfopen_s), so a reader is turned away
 //                       instead of seeing torn bytes. Always 0 on Linux, where the profile is
@@ -18,24 +20,142 @@ using System.IO;
 // an unexpected I/O error; 3 if it never managed a single valid read (no profile written at
 // all -- e.g. MulticoreJIT silently disabled below 2 CPUs): "nothing happened" must not pass.
 //
-// Like the runtime's player, this validates the HEADER only: it proves the writer publishes
-// atomically (no truncated/torn intermediate states), not that a reader survives a profile
-// with a valid header and a torn body (see README, "What this measures").
-//
-// Header layout mirrored from src/coreclr/vm/multicorejitimpl.h (HeaderRecord, 64B):
-//   recordID@0 == Pack8_24(1,64)=0x01000040 ; version@4 == 102 ; moduleCount@12 ;
-//   methodCount@16 ; MAX_MODULES=0x1000 ; MAX_METHODS=0xffff.
+// The structural validator mirrors the on-disk grammar in multicorejitimpl.h. It accepts
+// version 102 from the stock runtime and version 103 from the atomic-publication fix so one
+// harness can compare both cohorts. See README, "What this measures", for the remaining
+// semantic-replay limitation.
 class Detector
 {
+    const int HeaderSize = 64;
+    const int ModuleRecordFixedSize = 44;
+    const int ModuleNameLengthOffset = 38;
+    const int AssemblyNameLengthOffset = 40;
+    const int MaxProfileSize = 64 * 1024 * 1024;
+    const uint LegacyProfileVersion = 102;
+    const uint AtomicProfileVersion = 103;
+    const uint MaxModules = 0x1000;
+    const uint MaxMethods = 0xffff;
+
+    const uint ModuleRecordId = 2;
+    const uint ModuleDependencyRecordId = 3;
+    const uint MethodRecordId = 4;
+    const uint GenericMethodRecordId = 5;
+
     const int ERROR_SHARING_VIOLATION = 32;
     const int ERROR_LOCK_VIOLATION = 33;
+
+    static int Align4(int value) => (value + 3) & ~3;
+
+    static bool IsStructurallyValidProfile(ReadOnlySpan<byte> profile)
+    {
+        if (profile.Length <= HeaderSize)
+            return false;
+
+        uint headerRecordId = BinaryPrimitives.ReadUInt32LittleEndian(profile);
+        uint version = BinaryPrimitives.ReadUInt32LittleEndian(profile.Slice(4));
+        uint expectedModules = BinaryPrimitives.ReadUInt32LittleEndian(profile.Slice(12));
+        uint expectedMethods = BinaryPrimitives.ReadUInt32LittleEndian(profile.Slice(16));
+        uint expectedDependencies = BinaryPrimitives.ReadUInt32LittleEndian(profile.Slice(20));
+
+        if (headerRecordId != 0x01000040u ||
+            (version != LegacyProfileVersion && version != AtomicProfileVersion) ||
+            expectedModules > MaxModules || expectedMethods > MaxMethods)
+        {
+            return false;
+        }
+
+        int offset = HeaderSize;
+        uint modules = 0;
+        uint methods = 0;
+        uint dependencies = 0;
+        bool sawNonModuleRecord = false;
+
+        while (offset < profile.Length)
+        {
+            int remaining = profile.Length - offset;
+            if (remaining < sizeof(uint))
+                return false;
+
+            uint data1 = BinaryPrimitives.ReadUInt32LittleEndian(profile.Slice(offset));
+            uint recordType = data1 >> 24;
+            int recordLength;
+
+            switch (recordType)
+            {
+                case ModuleRecordId:
+                {
+                    if (sawNonModuleRecord || modules >= expectedModules)
+                        return false;
+
+                    recordLength = (int)(data1 & 0x00ff_ffffu);
+                    if (recordLength < ModuleRecordFixedSize ||
+                        (recordLength & 3) != 0 || recordLength > remaining)
+                    {
+                        return false;
+                    }
+
+                    ushort moduleNameLength = BinaryPrimitives.ReadUInt16LittleEndian(profile.Slice(offset + ModuleNameLengthOffset));
+                    ushort assemblyNameLength = BinaryPrimitives.ReadUInt16LittleEndian(profile.Slice(offset + AssemblyNameLengthOffset));
+                    int expectedLength = ModuleRecordFixedSize + Align4(moduleNameLength) + Align4(assemblyNameLength);
+                    if (recordLength != expectedLength)
+                        return false;
+
+                    modules++;
+                    break;
+                }
+
+                case ModuleDependencyRecordId:
+                    sawNonModuleRecord = true;
+                    recordLength = sizeof(uint);
+                    dependencies++;
+                    if ((data1 & 0xffffu) >= expectedModules)
+                        return false;
+                    break;
+
+                case MethodRecordId:
+                    sawNonModuleRecord = true;
+                    recordLength = 2 * sizeof(uint);
+                    methods++;
+                    if ((data1 & 0xffffu) >= expectedModules)
+                        return false;
+                    break;
+
+                case GenericMethodRecordId:
+                {
+                    sawNonModuleRecord = true;
+                    if (remaining < sizeof(uint) + sizeof(ushort))
+                        return false;
+
+                    ushort signatureLength = BinaryPrimitives.ReadUInt16LittleEndian(profile.Slice(offset + sizeof(uint)));
+                    recordLength = Align4(sizeof(uint) + sizeof(ushort) + signatureLength);
+                    methods++;
+                    if ((data1 & 0xffffu) >= expectedModules)
+                        return false;
+                    break;
+                }
+
+                default:
+                    return false;
+            }
+
+            if (recordLength > remaining || (recordLength & 3) != 0)
+                return false;
+
+            offset += recordLength;
+        }
+
+        return offset == profile.Length &&
+               modules == expectedModules &&
+               methods == expectedMethods &&
+               dependencies == expectedDependencies;
+    }
 
     static int Main(string[] args)
     {
         if (args.Length < 2) { Console.Error.WriteLine("usage: detector <path> <durationMs> [readyPath]"); return 1; }
         string path = args[0];
         long dur = long.Parse(args[1]);
-        byte[] buf = new byte[64];
+        byte[] buf = new byte[64 * 1024];
         long samples = 0, ok = 0, incomplete = 0, torn = 0, sharing = 0, missing = 0, ioErrors = 0;
 
         // Let the driver start writers only after the detector is initialized. The
@@ -52,17 +172,23 @@ class Detector
                 // deny-share open (Windows), not from us.
                 using var fs = new FileStream(path, FileMode.Open, FileAccess.Read,
                                               FileShare.ReadWrite | FileShare.Delete);
-                // A single Stream.Read is allowed to return fewer bytes than requested
-                // before EOF. Fill the complete header so only a real EOF is classified
-                // as an incomplete profile.
-                int n = fs.ReadAtLeast(buf, buf.Length, throwOnEndOfStream: false);
                 samples++;
-                if (n < 64) { incomplete++; continue; }
-                uint recordID  = BitConverter.ToUInt32(buf, 0);
-                uint version   = BitConverter.ToUInt32(buf, 4);
-                uint modCount  = BitConverter.ToUInt32(buf, 12);
-                uint methCount = BitConverter.ToUInt32(buf, 16);
-                if (recordID != 0x01000040u || version != 102u || modCount > 0x1000u || methCount > 0xffffu) { torn++; continue; }
+
+                long observedLength = fs.Length;
+                if (observedLength < HeaderSize) { incomplete++; continue; }
+                if (observedLength > MaxProfileSize) { torn++; continue; }
+
+                int expectedLength = (int)observedLength;
+                if (buf.Length < expectedLength)
+                    Array.Resize(ref buf, expectedLength);
+
+                // Read the complete snapshot exposed by this handle. A short read, or
+                // another byte appearing beyond the observed length, means an in-place
+                // writer changed the file while the detector was consuming it.
+                int n = fs.ReadAtLeast(buf.AsSpan(0, expectedLength), expectedLength, throwOnEndOfStream: false);
+                if (n < HeaderSize) { incomplete++; continue; }
+                if (n != expectedLength || fs.ReadByte() != -1) { torn++; continue; }
+                if (!IsStructurallyValidProfile(buf.AsSpan(0, n))) { torn++; continue; }
                 ok++;
             }
             catch (FileNotFoundException) { missing++; }
