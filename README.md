@@ -43,10 +43,11 @@ This is why the two drivers measure different things:
 
 ## Reproduce it
 
-To reproduce, you need a **.NET SDK that can target `net11.0`** (a .NET 11
-preview SDK; that is the app's target framework), with `dotnet` on `PATH`. On Linux you also
-need `gcc` (for the single native shim file); Windows needs no native compiler. Clone the
-repository and run the driver for your OS.
+The repository's `global.json` pins **.NET SDK 11.0.100-rc.1.26420.103**, which can
+target the app's `net11.0` framework. Make that SDK available to the `dotnet` muxer on
+`PATH`, or set `DOTNET_SDK` to the exact `dotnet` executable when SDKs are installed
+side by side in separate roots. On Linux you also need `gcc` for the single native shim
+file; Windows needs no native compiler. Clone the repository and run the driver for your OS.
 
 **Linux**
 
