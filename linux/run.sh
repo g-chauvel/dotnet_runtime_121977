@@ -5,7 +5,7 @@
 # runs N concurrent writers (under the shim) against ONE shared profile while the
 # detector samples it.
 #
-#   exit 2  -> INCOMPLETE/TORN observed = bug present (an UNPATCHED runtime)
+#   exit 2  -> INCOMPLETE/TORN/MISSING observed = bug present (an UNPATCHED runtime)
 #   exit 0  -> profile always complete+valid = atomic (a FIXED runtime)
 #   other   -> harness error (no profile seeded, no valid observation, detector died):
 #              NOT a pass; "nothing happened" must never report as "atomic".
@@ -69,8 +69,11 @@ echo "== live: detector + $WRITERS concurrent delayed writers for ${DUR_MS}ms ==
 export MCJ_DELAY_REPORT="$WORK/shim_report"
 "$RUN" "$DET" "$PROFILE" "$DUR_MS" > "$WORK/det.out" 2>&1 &
 det=$!
-end=$(( $(date +%s%3N) + DUR_MS ))
-while (( $(date +%s%3N) < end )); do
+# Keep the unit explicit. GNU date truncates %3N to milliseconds, while the
+# uutils date shipped by Ubuntu 26.04 currently emits all nine nanosecond
+# digits for %3N. Comparing epoch nanoseconds works with both implementations.
+end_ns=$(( $(date +%s%N) + DUR_MS * 1000000 ))
+while (( $(date +%s%N) < end_ns )); do
     pids=()
     for ((i=0; i<WRITERS; i++)); do
         LD_PRELOAD="$WORK/mcj_delay.so" MCJ_TARGET="$TARGET" WORKER_IDX=$i SLEEP_MS=20 \
@@ -93,8 +96,9 @@ else
     echo "shim: no report (no writer reached the shim)"
 fi
 
-# The live phase must actually have republished the profile, whatever the runtime: an
-# unchanged file means no writes were measured and the verdict would be vacuous.
+# The live phase must actually have republished the profile, whatever the runtime: a
+# missing or unchanged file means no successful atomic publication was measured.
+[ -f "$PROFILE" ] || { echo "ERROR: the profile disappeared during the live phase -- no verdict"; exit 1; }
 if [ "$(stat -c%Y "$PROFILE" 2>/dev/null || echo 0)" -eq "$SEED_MTIME" ] && \
    [ "$(stat -c%s "$PROFILE" 2>/dev/null || echo 0)" -eq "$SEED_SIZE" ]; then
     echo "ERROR: the profile never changed during the live phase -- nothing was measured"

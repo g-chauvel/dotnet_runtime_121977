@@ -13,9 +13,10 @@ using System.IO;
 //                       in-place write opens deny-share (_wfopen_s), so a reader is turned away
 //                       instead of seeing torn bytes. Always 0 on Linux, where the profile is
 //                       opened with plain fopen, which has no sharing semantics.
-// exit 2 if any of those were observed; 0 if the reader always read a complete, valid profile;
-// exit 3 if it never managed a single valid read (no profile written at all -- e.g. MulticoreJIT
-// silently disabled below 2 CPUs): "nothing happened" must not pass as "atomic".
+//   MISSING           = the seeded final path disappeared during the live phase.
+// exit 2 if any non-atomic state was observed; 0 if every read was complete and valid; 1 for
+// an unexpected I/O error; 3 if it never managed a single valid read (no profile written at
+// all -- e.g. MulticoreJIT silently disabled below 2 CPUs): "nothing happened" must not pass.
 //
 // Like the runtime's player, this validates the HEADER only: it proves the writer publishes
 // atomically (no truncated/torn intermediate states), not that a reader survives a profile
@@ -35,7 +36,7 @@ class Detector
         string path = args[0];
         long dur = long.Parse(args[1]);
         byte[] buf = new byte[8192];
-        long samples = 0, ok = 0, incomplete = 0, torn = 0, sharing = 0, missing = 0;
+        long samples = 0, ok = 0, incomplete = 0, torn = 0, sharing = 0, missing = 0, ioErrors = 0;
         var sw = Stopwatch.StartNew();
         while (sw.ElapsedMilliseconds < dur)
         {
@@ -61,11 +62,15 @@ class Detector
             {
                 int code = ex.HResult & 0xFFFF;
                 if (code == ERROR_SHARING_VIOLATION || code == ERROR_LOCK_VIOLATION) sharing++;
-                else missing++;
+                else ioErrors++;
             }
         }
-        Console.WriteLine($"DETECTOR path={path} dur={dur}ms samples={samples} OK={ok} INCOMPLETE={incomplete} TORN={torn} SHARING_VIOLATION={sharing} missing={missing}");
-        if (incomplete + torn + sharing > 0) return 2;
+        Console.WriteLine($"DETECTOR path={path} dur={dur}ms samples={samples} OK={ok} INCOMPLETE={incomplete} TORN={torn} SHARING_VIOLATION={sharing} MISSING={missing} IO_ERROR={ioErrors}");
+        // An unexpected I/O error is a harness failure, not evidence for either verdict.
+        if (ioErrors > 0) return 1;
+        // The profile is seeded before sampling starts, so a missing observation is also
+        // a non-atomic state rather than an expected startup race.
+        if (incomplete + torn + sharing + missing > 0) return 2;
         // Exit 0 must mean "writes were observed and were atomic", not "nothing happened".
         if (ok == 0) return 3;
         return 0;

@@ -113,10 +113,10 @@ observes a non-atomic intermediate state"*:
   rewrite tears without the shim too (truncate + buffered ~4 KiB flushes of a tens-of-KB
   body); the shim just makes the windows wide enough to be sampled reliably.
 - **`detector/Detector.cs`** — one C# reader loop, shared by both OSes, that opens the
-  shared profile in a tight loop and counts `INCOMPLETE` / `TORN` (and, on Windows,
-  `SHARING_VIOLATION`) observations. Exits `2` if it ever sees one, `0` if every read
-  was complete and valid, `3` if it never got a single valid read (a harness error —
-  "nothing happened" must not pass as "atomic").
+  shared profile in a tight loop and counts `INCOMPLETE` / `TORN` / `MISSING` (and, on
+  Windows, `SHARING_VIOLATION`) observations. Exits `2` if it ever sees one, `0` if every
+  read was complete and valid, `1` for an unexpected I/O error, and `3` if it never got
+  a single valid read (a harness error — "nothing happened" must not pass as "atomic").
 
 A runtime that writes to a private `*.tmp` file and publishes it with a rename
 never touches the final path mid-write, so it **evades the shim by construction** — and

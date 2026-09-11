@@ -5,7 +5,7 @@
 # of reading torn bytes. This driver runs N concurrent writers against one shared profile
 # while a reader (Detector.cs) samples it, and counts what the reader observes.
 #
-#   exit 2  -> reader saw SHARING_VIOLATION (or torn/incomplete) = contention present (UNPATCHED)
+#   exit 2  -> reader saw SHARING_VIOLATION (or torn/incomplete/missing) = contention present (UNPATCHED)
 #   exit 0  -> reader was never blocked and always read a complete profile = FIXED
 #   other   -> harness error (no profile seeded, no valid observation, detector died):
 #              NOT a pass; "nothing happened" must never report as "fixed".
@@ -96,10 +96,13 @@ try {
     $detProc.WaitForExit()
     Get-Content $detOut
 
-    # The live phase must actually have republished the profile, whatever the runtime: an
-    # unchanged file means no writes were measured and the verdict would be vacuous.
+    # The live phase must actually have republished the profile, whatever the runtime: a
+    # missing or unchanged file means no successful atomic publication was measured.
     $after = Get-Item $profilePath -ErrorAction SilentlyContinue
-    if ($null -ne $after -and $after.LastWriteTimeUtc -eq $seedStamp -and $after.Length -eq $seeded) {
+    if ($null -eq $after) {
+        throw "the profile disappeared during the live phase -- no verdict"
+    }
+    if ($after.LastWriteTimeUtc -eq $seedStamp -and $after.Length -eq $seeded) {
         throw "the profile never changed during the live phase -- nothing was measured"
     }
 
