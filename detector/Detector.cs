@@ -35,7 +35,7 @@ class Detector
         if (args.Length < 2) { Console.Error.WriteLine("usage: detector <path> <durationMs>"); return 1; }
         string path = args[0];
         long dur = long.Parse(args[1]);
-        byte[] buf = new byte[8192];
+        byte[] buf = new byte[64];
         long samples = 0, ok = 0, incomplete = 0, torn = 0, sharing = 0, missing = 0, ioErrors = 0;
         var sw = Stopwatch.StartNew();
         while (sw.ElapsedMilliseconds < dur)
@@ -46,7 +46,10 @@ class Detector
                 // deny-share open (Windows), not from us.
                 using var fs = new FileStream(path, FileMode.Open, FileAccess.Read,
                                               FileShare.ReadWrite | FileShare.Delete);
-                int n = fs.Read(buf, 0, buf.Length);
+                // A single Stream.Read is allowed to return fewer bytes than requested
+                // before EOF. Fill the complete header so only a real EOF is classified
+                // as an incomplete profile.
+                int n = fs.ReadAtLeast(buf, buf.Length, throwOnEndOfStream: false);
                 samples++;
                 if (n < 64) { incomplete++; continue; }
                 uint recordID  = BitConverter.ToUInt32(buf, 0);
