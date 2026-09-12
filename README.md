@@ -99,6 +99,18 @@ legacy `MoveFileExW` replacement under an open reader, then success with `FileRe
 POSIX replacement. These controlled publisher checks validate the detector; they do not
 substitute for running the driver against a patched runtime.
 
+Both Windows drivers register each child as soon as it starts. On normal completion or
+an exception, they stop remaining children, wait for exit and dispose their process
+handles. Completed writer batches are disposed immediately, keeping process tracking
+bounded. Cleanup operates only on children registered by that invocation; logs and
+profiles remain in the printed work directory.
+
+Run `.\test-process-cleanup.ps1` to inject failures at live-detector readiness, midway
+through writer startup, at held-reader readiness, and in the controlled publisher test.
+It invokes the real drivers and requires independently retained process handles to be
+exited before the failed driver returns. It runs on PowerShell 5.1 and 7+ and uses the
+pinned SDK; it does not build CoreCLR or validate a runtime publication fix.
+
 Tunables: `DUR_MS`/`WRITERS` (Linux env vars), `-DurationMs`/`-Writers` (Windows params).
 The app targets `net11.0` — the runtime whose profile write path is the CRT `fopen`/`fwrite`
 the shim hooks. On an older SDK you can lower `<TargetFramework>` in `app/mcjrepro.csproj`

@@ -2,6 +2,8 @@
 # This validates the detector and Windows rename APIs; it is not a patched-runtime test.
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 3.0
+. (Join-Path $PSScriptRoot 'process-cleanup.ps1')
+$ownedProcesses = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
 $sdk = if ($env:DOTNET_SDK) { $env:DOTNET_SDK } else { (Get-Command dotnet).Source }
 # Resolve relative SDK paths before entering the directory containing global.json.
 $sdk = (Resolve-Path -LiteralPath $sdk).ProviderPath
@@ -83,6 +85,7 @@ foreach ($case in @('none', 'legacy', 'posix')) {
     $output = Join-Path $work "$case.out"
     $arguments = '"{0}" --hold-reader "{1}" 2000 "{2}"' -f (Join-Path $work 'det/detector.dll'), $target, $ready
     $process = Start-Process $sdk -ArgumentList $arguments -PassThru -NoNewWindow -RedirectStandardOutput $output
+    $ownedProcesses.Add($process)
     $null = $process.Handle
     $wait = [Diagnostics.Stopwatch]::StartNew()
     while (-not (Test-Path $ready) -and -not $process.HasExited -and $wait.ElapsedMilliseconds -lt 10000) {
@@ -106,5 +109,6 @@ foreach ($case in @('none', 'legacy', 'posix')) {
 Write-Host "work dir left at: $work"
 }
 finally {
-    $env:DOTNET_ROOT = $savedRoot
+    try { Stop-HarnessProcesses $ownedProcesses }
+    finally { $env:DOTNET_ROOT = $savedRoot }
 }

@@ -32,6 +32,8 @@ function Assert-ExitOk([string]$What) {
 }
 
 $here = $PSScriptRoot
+. (Join-Path $here 'process-cleanup.ps1')
+$ownedProcesses = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
 $appProj = Join-Path $here "..\app\mcjrepro.csproj"
 $detProj = Join-Path $here "..\detector\detector.csproj"
 $target = "StartupProfileData-Repro"
@@ -95,6 +97,7 @@ try {
     $detReady = Join-Path $work "det.ready"
     $detArgs = '"{0}" "{1}" {2} "{3}"' -f $det, $profilePath, $DurationMs, $detReady
     $detProc = Start-Process -FilePath $run -ArgumentList $detArgs -PassThru -NoNewWindow -RedirectStandardOutput $detOut
+    $ownedProcesses.Add($detProc)
     # Windows PowerShell 5.1 must retain the handle before HasExited closes it;
     # otherwise ExitCode can remain null even after WaitForExit.
     $null = $detProc.Handle
@@ -115,9 +118,15 @@ try {
         $procs = @()
         for ($i = 0; $i -lt $Writers; $i++) {
             $wArgs = '"{0}" {1}' -f $app, $i
-            $procs += Start-Process -FilePath $run -ArgumentList $wArgs -PassThru -NoNewWindow
+            $writer = Start-Process -FilePath $run -ArgumentList $wArgs -PassThru -NoNewWindow
+            $ownedProcesses.Add($writer)
+            $procs += $writer
         }
-        $procs | ForEach-Object { $_.WaitForExit() }
+        foreach ($writer in $procs) {
+            $writer.WaitForExit()
+            $null = $ownedProcesses.Remove($writer)
+            $writer.Dispose()
+        }
         if (-not $detProc.HasExited) {
             $during = Get-Item $profilePath -ErrorAction SilentlyContinue
             if ($null -ne $during -and ($during.LastWriteTimeUtc -ne $seedStamp -or $during.Length -ne $seeded)) {
@@ -151,6 +160,7 @@ try {
     $heldReady = Join-Path $work "held.ready"
     $heldArgs = '"{0}" --hold-reader "{1}" {2} "{3}"' -f $det, $profilePath, $heldDuration, $heldReady
     $heldProc = Start-Process -FilePath $run -ArgumentList $heldArgs -PassThru -NoNewWindow -RedirectStandardOutput $heldOut
+    $ownedProcesses.Add($heldProc)
     $null = $heldProc.Handle
     $heldWait = [System.Diagnostics.Stopwatch]::StartNew()
     while (-not (Test-Path $heldReady) -and -not $heldProc.HasExited -and $heldWait.ElapsedMilliseconds -lt 10000) {
@@ -164,9 +174,15 @@ try {
         $procs = @()
         for ($i = 0; $i -lt $Writers; $i++) {
             $wArgs = '"{0}" {1}' -f $app, $i
-            $procs += Start-Process -FilePath $run -ArgumentList $wArgs -PassThru -NoNewWindow
+            $writer = Start-Process -FilePath $run -ArgumentList $wArgs -PassThru -NoNewWindow
+            $ownedProcesses.Add($writer)
+            $procs += $writer
         }
-        $procs | ForEach-Object { $_.WaitForExit() }
+        foreach ($writer in $procs) {
+            $writer.WaitForExit()
+            $null = $ownedProcesses.Remove($writer)
+            $writer.Dispose()
+        }
     }
     $heldProc.WaitForExit()
     Get-Content $heldOut
@@ -184,6 +200,9 @@ try {
     exit $rc
 }
 finally {
-    # Left in place on purpose (a throwaway dir under %TEMP%); delete it yourself when done.
-    Write-Host "work dir left at: $work"
+    try { Stop-HarnessProcesses $ownedProcesses }
+    finally {
+        # Preserve logs and profiles even when a detector or writer must be stopped.
+        Write-Host "work dir left at: $work"
+    }
 }
