@@ -12,37 +12,53 @@ shared by every pwsh session under one `$HOME`). `MulticoreJitRecorder::WriteOut
 writes that final file **in place**: `fopen("wb")` (truncate), then a sequence of
 fragmented buffered writes, with **no inter-process lock**.
 
-When several processes shut down at about the same time, their writes tear each other's
-output. A process starting concurrently reads the half-written file; the player validates
-only the **header**, so a torn body drives the JIT into unbounded recursion and the process
-dies at startup with an uncatchable `Stack overflow.`/SIGABRT or a segfault, before
-producing any output.
+On Linux, overlapping writes can tear each other's output, and a process starting
+concurrently can read an incomplete or mixed profile. The player's header validation
+does not establish the validity of the complete body. Corrupt replay data can contribute
+to the reported startup `Stack overflow.`/SIGABRT or segfault failures. This harness
+measures the file-publication defect; its detector does not demonstrate a downstream JIT
+crash or prove that every structurally invalid sample would cause one.
 
 ## Platform difference (important)
 
 | | Linux | Windows |
 |---|---|---|
 | In-place write share mode | plain `fopen` → no sharing semantics | deny-share (`_wfopen_s`) |
-| What a concurrent reader sees | **torn / incomplete profile** → JIT crash | **`ERROR_SHARING_VIOLATION`** (refused) |
+| What a concurrent reader sees | **torn / incomplete profile** (replay can crash) | **`ERROR_SHARING_VIOLATION`** (refused) |
 | When the profile is written | shutdown only (timer is `#ifndef TARGET_UNIX`) | shutdown + delayed-write timer |
 
-So the **corruption itself is a Unix manifestation**. On Windows the deny-share open
-prevents torn reads, but turns every in-place write window into a sharing violation for
-readers (and silently drops a second concurrent writer's update). The fix — write to a
-private temp file, publish it with `rename(2)` (atomic by POSIX contract) on Linux and
-`MoveFileExW(MOVEFILE_REPLACE_EXISTING)` on Windows — removes both: the final path is
-never opened for write, so Linux readers never see a torn profile and Windows readers are
-never refused. It also advances the profile format from version 102 to 103: patched
-runtimes reject stale profiles that may already be corrupt, and patched and unpatched
-cohorts do not consume each other's cache entries. (The move is same-directory with no
-`MOVEFILE_COPY_ALLOWED`, so it cannot silently degrade to copy+delete; the Windows benefit
-rests on the final path never being write-opened, not on documented `MoveFileExW`
-atomicity.)
+On Windows, deny-share opens prevent the original overlapping in-place read/write case,
+but can refuse readers and silently drop a competing writer's update. A complete
+publication fix writes a private temporary file in the same directory and replaces the
+final path after completing the file. Linux uses `rename(2)` for atomic namespace
+replacement; this is a visibility guarantee, not a crash-durability guarantee.
 
-This is why the two drivers measure different things:
-- **Linux** reproduces the actual defect (torn/incomplete reads) deterministically.
-- **Windows** demonstrates the reader contention (sharing violations). It does **not**
-  reproduce a crash — Windows is immune to the torn read.
+The revised Windows implementation uses
+`SetFileInformationByHandle(FileRenameInfoEx)` with
+`FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS`.
+The [Windows FILE_RENAME_INFO documentation](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_rename_info)
+describes the flags layout used with `FileRenameInfoEx`.
+It must support publication while runtime readers retain handles opened with read and
+delete sharing, but without write sharing. `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`
+alone is insufficient: replacement can fail under such a reader even though it permits
+deletion. Avoiding a write-open of the final path does not prove that publication will
+succeed. The Windows driver tests actual replacement and the retained reader's snapshot;
+it makes no general claim about `MoveFileExW` atomicity. Filesystem/API support and
+readers that deny delete sharing remain relevant constraints.
+
+The format changes from version 102 to 103. Version checks reject an intact profile from
+the other format, including old version-102 caches, but do not isolate writers: both
+versions still use the same final filename. An unpatched writer can overwrite or truncate
+a version-103 file. A mixed cohort therefore has no general safe-publication guarantee;
+upgrade every writer sharing the root, or use separate profile roots.
+
+The drivers exercise these contracts:
+
+- **Linux** samples incomplete/torn reads while a shim widens the original write windows.
+- **Windows** samples reader contention and snapshot integrity, then requires successful
+  publication while a runtime-style reader keeps its old profile handle open.
+
+Neither driver establishes the absence of all startup crashes on either platform.
 
 ## Reproduce it
 
@@ -72,9 +88,16 @@ RESULT: NON-ATOMIC -- reader observed an incomplete/torn profile (bug present).
 cd windows
 .\run.ps1
 ```
-Expected — reader contention (exit 2): `SHARING_VIOLATION` > 0, `RESULT: CONTENTION`. Windows
-does not show torn reads (deny-share open refuses the concurrent reader instead) — see
-"Platform difference" above.
+Expected on a stock runtime — exit 2, `RESULT: CONTENTION`: live sampling may observe
+`SHARING_VIOLATION`, and the held-reader phase reports no replacement. A clean run must
+also print `HELD_READER: publication observed; old handle unchanged`; zero sharing
+violations alone are insufficient.
+
+For targeted checks of the held-reader detector and Windows APIs, run
+`.\test-held-reader.ps1` from this directory. It requires rejection of no publication and
+legacy `MoveFileExW` replacement under an open reader, then success with `FileRenameInfoEx`
+POSIX replacement. These controlled publisher checks validate the detector; they do not
+substitute for running the driver against a patched runtime.
 
 Tunables: `DUR_MS`/`WRITERS` (Linux env vars), `-DurationMs`/`-Writers` (Windows params).
 The app targets `net11.0` — the runtime whose profile write path is the CRT `fopen`/`fwrite`
@@ -97,12 +120,16 @@ assembled per
 DOTNET_ROOT=/path/to/a-runtime ./run.sh                             # exit 0: 0 torn reads, 0 shim hits
 ```
 ```powershell
-$env:DOTNET_ROOT = "C:\path\to\a-runtime"; .\run.ps1                # exit 0: 0 sharing violations
+$env:DOTNET_ROOT = "C:\path\to\a-runtime"; .\run.ps1                # exit 0: valid snapshots and successful held-reader publication
 ```
 
-## How it works (~40s per run)
+## How it works
 
-Waiting for the downstream JIT crash is lossy and flaky (reporters see "1 to 300 tries").
+Each live sampling window defaults to 15 seconds. Total elapsed time also includes builds,
+seeding, sanity checks, waiting for writers to shut down, and up to 5 seconds for the
+Windows held-reader phase. Writer delays can make a run substantially longer.
+
+Waiting for the downstream JIT crash is probabilistic.
 Instead we measure the defect **at its source** — the fix's contract is *"a reader never
 observes a non-atomic intermediate state"*:
 
@@ -121,11 +148,19 @@ observes a non-atomic intermediate state"*:
   sizes, alignment, module indexes, header counts, and exact end of file. It accepts
   version 102 from the stock runtime and version 103 from the atomic-publication fix.
   It counts `INCOMPLETE` / `TORN` / `MISSING` (and, on Windows, `SHARING_VIOLATION`)
-  observations. It exits `2` if it ever sees one, `0` if every read was structurally
-  valid, `1` for an unexpected I/O error, and `3` if it never got a single valid read
-  (a harness error — "nothing happened" must not pass as "atomic"). The drivers wait
+  observations. Unexpected I/O errors return `1`; otherwise any observed anomaly returns
+  `2`. With no anomalies it returns `0` only after a valid read, or `3` when no valid read
+  occurred. An anomaly takes precedence over the no-valid-read check. The drivers wait
   for an explicit detector-ready signal before starting writers and accept a clean
   verdict only when a publication completed while the detector was alive.
+- **Windows held-reader phase** — keeps a valid profile open with
+  `FileShare.Read | FileShare.Delete`, records its file identity and complete bytes, and
+  starts another writer workload. Success requires a different file identity at the
+  final path, a structurally valid replacement, and identical bytes through the original
+  still-open handle. This detects publication failures that rapid read/write/delete
+  sampling could miss. It excludes `FileShare.Write`, matching the runtime reader
+  contract. No replacement or a changed/invalid snapshot returns `2`; setup/I/O failures
+  are harness errors.
 
 A runtime that writes to a private `*.tmp` file and publishes it with a rename
 never touches the final path mid-write, so it **evades the shim by construction** — and
@@ -144,33 +179,45 @@ of **different sizes** (even = tiny, odd = large) to maximize the torn-merge win
 app/      Program.cs, mcjrepro.csproj    the repro app (one StartProfile per process), portable
 detector/ Detector.cs, detector.csproj   the reader-side detector, shared by both OSes
 linux/    mcj_delay.c, run.sh            LD_PRELOAD shim (C) + driver
-windows/  run.ps1                        driver
+windows/  run.ps1, test-held-reader.ps1   driver + controlled publication checks
 ```
 
-The app and the detector are portable C#; only the `LD_PRELOAD` shim (which must interpose
+The app and the default detector sampling mode are portable C#. The held-reader mode
+and its controlled publication checks are Windows-only. The `LD_PRELOAD` shim (which must interpose
 the CRT `fopen`/`fwrite` calls at the loader level) is native C, so `gcc` is needed on
 Linux for that one file. Windows needs no native compiler — just a .NET SDK.
 
 ## What this measures (and what it does not)
 
-The harness verifies writer-side publication for this implementation: with the fix, a
-reader observes a structurally complete old or new profile instead of an intermediate
-record stream. Two deliberate limits:
+The harness measures publication under the tested workload and filesystem. A clean run
+means the sampled profiles were structurally valid, a publication completed during
+sampling, and on Windows replacement also succeeded with an old reader held open.
+It is evidence for these contracts in that run, not proof that every concurrency schedule
+is safe or that all startup crashes are fixed.
 
-- The detector verifies the complete record grammar but not the semantic validity of
-  signatures or metadata. Corruption that happens to form a structurally valid stream
-  may therefore escape it, and the harness does not exercise the player's replay path.
-- Each run tests **one runtime cohort**. The version bump isolates patched and unpatched
-  readers and writers, but an entirely unpatched cohort can still corrupt and consume
-  version-102 profiles until all relevant runtimes receive the servicing fix.
+- The detector validates record grammar, lengths, indexes and counts, but not semantic
+  signature/metadata validity. A structurally valid corruption can escape it.
+- The drivers suppress writer output and intentionally ignore writer exit codes, so they
+  do not classify player crashes. Even though writers can replay a shared profile, that
+  replay is not independently checked by the harness.
+- Each run uses **one runtime cohort**. The format bump rejects incompatible complete
+  profiles but leaves the filename shared. Mixed patched/unpatched writers can still
+  overwrite one another; this harness does not verify mixed-cohort safety.
+- The Linux shim deliberately amplifies final-path in-place writes and excludes `*.tmp`
+  paths. Nonzero hit counts confirm that instrumentation fired; zero counts do not alone
+  establish publication success. The independent detector/publication checks are needed.
+- Windows replacement is tested with delete-sharing readers on the local test filesystem.
+  Readers denying deletion, unsupported filesystems/APIs, and machine-crash durability
+  are outside this test.
 
 ## The actual startup crash (Linux, for the original symptom)
 
-This is the heavy-tailed, non-deterministic path that the harness above deliberately replaces
-with a fast atomicity measurement; it is shown only to connect the repro to the originally
-reported symptom. To get the crash from the issue rather than the atomicity measurement: run many of these
-processes sharing one `$HOME` under a CPU-throttled cgroup (`--cpus=2` / `CPUQuota=200%`)
-on an otherwise idle host. The brief CFS freeze widens the torn-write window enough that a
-starting process replays a corrupt profile and dies with `Stack overflow.` (exit 134) or a
-segfault (139). It is probabilistic — median a few minutes, heavy-tailed — which is exactly
-the flaky-CI signature reporters describe.
+The original symptom is a probabilistic startup failure when processes share a profile
+root. A separate crash experiment must preserve writer/player output and exit statuses
+and identify the runtime and resource limits used. `Stack overflow.`/SIGABRT or a segfault
+must be observed directly before reporting that the startup crash was reproduced.
+
+CPU-throttled workloads can widen scheduling windows, but this harness does not establish
+a reliable time-to-crash distribution or guarantee that a particular cgroup limit will
+reproduce the failure. Its `INCOMPLETE`/`TORN` counts demonstrate invalid published bytes;
+they are not themselves a JIT-crash measurement.
