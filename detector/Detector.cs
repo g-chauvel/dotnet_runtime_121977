@@ -1,7 +1,10 @@
 using System;
 using System.Buffers.Binary;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 
 // Reader-side detector for dotnet/runtime#121977, shared by the Linux and Windows runners.
 // The fix's contract is "a reader never observes a non-atomic intermediate state", so this
@@ -150,8 +153,102 @@ class Detector
                dependencies == expectedDependencies;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    struct FileInformation
+    {
+        public uint Attributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    static extern bool GetFileInformationByHandle(SafeFileHandle handle, out FileInformation information);
+
+    static (uint Volume, uint High, uint Low) FileIdentity(FileStream stream)
+    {
+        if (!GetFileInformationByHandle(stream.SafeFileHandle, out FileInformation information))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        return (information.VolumeSerialNumber, information.FileIndexHigh, information.FileIndexLow);
+    }
+
+    static byte[] Snapshot(FileStream stream)
+    {
+        long length = stream.Length;
+        if (length < HeaderSize || length > MaxProfileSize)
+            throw new InvalidDataException("profile length outside supported bounds");
+        byte[] bytes = new byte[(int)length];
+        stream.Position = 0;
+        stream.ReadExactly(bytes);
+        if (stream.ReadByte() != -1)
+            throw new InvalidDataException("profile grew during snapshot");
+        return bytes;
+    }
+
+    // Exercise publication while an actual runtime-style Windows reader stays open.
+    // FileShare.Read|Delete deliberately excludes Write: an in-place writer is blocked,
+    // and legacy replacement APIs can also fail even though this reader permits deletion.
+    static int HoldReader(string path, long duration, string readyPath)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Console.Error.WriteLine("--hold-reader is a Windows publication test");
+            return 1;
+        }
+        try
+        {
+            using var held = new FileStream(path, FileMode.Open, FileAccess.Read,
+                                            FileShare.Read | FileShare.Delete, bufferSize: 1);
+            var originalIdentity = FileIdentity(held);
+            byte[] original = Snapshot(held);
+            if (!IsStructurallyValidProfile(original))
+                throw new InvalidDataException("held reader requires a valid seeded profile");
+            File.WriteAllText(readyPath, string.Empty);
+
+            var stopwatch = Stopwatch.StartNew();
+            while (stopwatch.ElapsedMilliseconds < duration)
+            {
+                using var current = new FileStream(path, FileMode.Open, FileAccess.Read,
+                                                   FileShare.Read | FileShare.Delete, bufferSize: 1);
+                if (FileIdentity(current) != originalIdentity)
+                {
+                    if (!IsStructurallyValidProfile(Snapshot(current)) ||
+                        !original.AsSpan().SequenceEqual(Snapshot(held)))
+                    {
+                        Console.WriteLine("HELD_READER: replacement invalid or old handle changed");
+                        return 2;
+                    }
+                    Console.WriteLine("HELD_READER: publication observed; old handle unchanged");
+                    return 0;
+                }
+                System.Threading.Thread.Sleep(10);
+            }
+            if (!original.AsSpan().SequenceEqual(Snapshot(held)))
+            {
+                Console.WriteLine("HELD_READER: old handle changed without a replacement");
+                return 2;
+            }
+            Console.WriteLine("HELD_READER: no replacement while reader was open");
+            return 2;
+        }
+        catch (Exception exception) when (exception is IOException || exception is Win32Exception)
+        {
+            Console.Error.WriteLine($"HELD_READER: test failed: {exception.Message}");
+            return 1;
+        }
+    }
+
     static int Main(string[] args)
     {
+        if (args.Length == 4 && args[0] == "--hold-reader")
+            return HoldReader(args[1], long.Parse(args[2]), args[3]);
         if (args.Length < 2) { Console.Error.WriteLine("usage: detector <path> <durationMs> [readyPath]"); return 1; }
         string path = args[0];
         long dur = long.Parse(args[1]);

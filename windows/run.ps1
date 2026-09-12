@@ -5,8 +5,8 @@
 # of reading torn bytes. This driver runs N concurrent writers against one shared profile
 # while a reader (Detector.cs) samples it, and counts what the reader observes.
 #
-#   exit 2  -> reader saw SHARING_VIOLATION (or torn/incomplete/missing) = contention present (UNPATCHED)
-#   exit 0  -> reader was never blocked and always read a complete profile = FIXED
+#   exit 2  -> invalid/blocked read, or publication failed with a reader open
+#   exit 0  -> valid snapshots and replacement succeeded while an old reader stayed open
 #   other   -> harness error (no profile seeded, no valid observation, detector died):
 #              NOT a pass; "nothing happened" must never report as "fixed".
 #
@@ -133,9 +133,39 @@ try {
     if ($rc -eq 0 -and -not $overlapObserved) {
         throw "no profile publication completed while the detector was running -- no verdict"
     }
+    Write-Host "== publication while a FileShare.Read|Delete reader stays open =="
+    $heldDuration = [Math]::Min($DurationMs, 5000)
+    $heldOut = Join-Path $work "held.out"
+    $heldReady = Join-Path $work "held.ready"
+    $heldArgs = '"{0}" --hold-reader "{1}" {2} "{3}"' -f $det, $profilePath, $heldDuration, $heldReady
+    $heldProc = Start-Process -FilePath $run -ArgumentList $heldArgs -PassThru -NoNewWindow -RedirectStandardOutput $heldOut
+    $null = $heldProc.Handle
+    $heldWait = [System.Diagnostics.Stopwatch]::StartNew()
+    while (-not (Test-Path $heldReady) -and -not $heldProc.HasExited -and $heldWait.ElapsedMilliseconds -lt 10000) {
+        Start-Sleep -Milliseconds 10
+    }
+    if (-not (Test-Path $heldReady)) {
+        if ($heldProc.HasExited) { Get-Content $heldOut }
+        throw "held reader did not become ready -- no verdict"
+    }
+    while (-not $heldProc.HasExited) {
+        $procs = @()
+        for ($i = 0; $i -lt $Writers; $i++) {
+            $wArgs = '"{0}" {1}' -f $app, $i
+            $procs += Start-Process -FilePath $run -ArgumentList $wArgs -PassThru -NoNewWindow
+        }
+        $procs | ForEach-Object { $_.WaitForExit() }
+    }
+    $heldProc.WaitForExit()
+    Get-Content $heldOut
+    $heldRc = $heldProc.ExitCode
+    if ($null -eq $heldRc) { throw "held-reader exit code unavailable -- no verdict" }
+    if ($heldRc -ne 0 -and $heldRc -ne 2) { throw "held-reader test failed (exit $heldRc) -- no verdict" }
+    if ($rc -eq 0 -and $heldRc -eq 2) { $rc = 2 }
+
     switch ($rc) {
-        0       { Write-Host "RESULT: CLEAN -- reader never blocked, always read a complete profile (fixed)." }
-        2       { Write-Host "RESULT: CONTENTION -- reader observed sharing violations / torn profile (unpatched)." }
+        0       { Write-Host "RESULT: CLEAN -- reader snapshots valid; publication succeeded with the old handle unchanged." }
+        2       { Write-Host "RESULT: CONTENTION -- reader observed an invalid/blocked read or publication failed with a reader open." }
         3       { Write-Host "ERROR: detector never managed a single valid read -- no verdict." }
         default { Write-Host "ERROR: detector failed (exit $rc) -- no verdict." }
     }
