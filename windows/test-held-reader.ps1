@@ -55,13 +55,18 @@ public static class HeldReaderPublisher {
             int rootOffset = IntPtr.Size == 8 ? 8 : 4;
             int lengthOffset = rootOffset + IntPtr.Size;
             int nameOffset = lengthOffset + 4;
-            IntPtr buffer = Marshal.AllocHGlobal(nameOffset + name.Length);
+            // FileNameLength excludes the terminator, but provide and initialize one:
+            // FileRenameInfoEx otherwise consumed uninitialized bytes in this probe on
+            // Windows and could create a malformed target name.
+            int bufferBytes = checked(nameOffset + name.Length + sizeof(char));
+            IntPtr buffer = Marshal.AllocHGlobal(bufferBytes);
             try {
                 Marshal.WriteInt32(buffer, 0, 3); // REPLACE_IF_EXISTS | POSIX_SEMANTICS
                 Marshal.WriteIntPtr(buffer, rootOffset, IntPtr.Zero);
                 Marshal.WriteInt32(buffer, lengthOffset, name.Length);
                 Marshal.Copy(name, 0, IntPtr.Add(buffer, nameOffset), name.Length);
-                if (!SetFileInformationByHandle(handle, 22, buffer, (uint)(nameOffset + name.Length)))
+                Marshal.WriteInt16(buffer, nameOffset + name.Length, 0);
+                if (!SetFileInformationByHandle(handle, 22, buffer, (uint)bufferBytes))
                     throw new Win32Exception(Marshal.GetLastWin32Error());
             } finally { Marshal.FreeHGlobal(buffer); }
         }
