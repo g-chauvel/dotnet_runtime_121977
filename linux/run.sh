@@ -100,15 +100,25 @@ while (( $(date +%s%N) < end_ns )) && kill -0 "$det" 2>/dev/null; do
         LD_PRELOAD="$WORK/mcj_delay.so" MCJ_TARGET="$TARGET" WORKER_IDX=$i SLEEP_MS=20 \
             "$RUN" "$APP" >/dev/null 2>&1 & pids+=($!)
     done
+    # Observe publication while writers are active: one slow writer must not hide a
+    # faster writer's publication until after the detector's sampling window closes.
+    while kill -0 "$det" 2>/dev/null; do
+        writers_running=0
+        for p in "${pids[@]}"; do
+            if kill -0 "$p" 2>/dev/null; then writers_running=1; break; fi
+        done
+        current_state=$(stat -c '%i:%s:%y' "$PROFILE" 2>/dev/null || true)
+        # Check the detector on both sides of stat so a late publication does not count.
+        if [ -n "$current_state" ] && [ "$current_state" != "$SEED_STATE" ] && \
+           kill -0 "$det" 2>/dev/null; then
+            overlap_observed=1
+        fi
+        [ "$writers_running" -eq 1 ] || break
+        sleep 0.01
+    done
     # A writer may crash on the unpatched runtime (it replays a torn profile); that is
     # an expected outcome here, not a script error, so do not let it trip 'set -e'.
     for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done
-    if kill -0 "$det" 2>/dev/null; then
-        current_state=$(stat -c '%i:%s:%y' "$PROFILE" 2>/dev/null || true)
-        if [ -n "$current_state" ] && [ "$current_state" != "$SEED_STATE" ]; then
-            overlap_observed=1
-        fi
-    fi
 done
 # The detector exits 2 when it observes torn/incomplete (the control case): capture that
 # code instead of letting 'set -e' abort on it.
