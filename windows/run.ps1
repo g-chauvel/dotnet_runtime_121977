@@ -83,6 +83,9 @@ try {
     $detReady = Join-Path $work "det.ready"
     $detArgs = '"{0}" "{1}" {2} "{3}"' -f $det, $profilePath, $DurationMs, $detReady
     $detProc = Start-Process -FilePath $run -ArgumentList $detArgs -PassThru -NoNewWindow -RedirectStandardOutput $detOut
+    # Windows PowerShell 5.1 must retain the handle before HasExited closes it;
+    # otherwise ExitCode can remain null even after WaitForExit.
+    $null = $detProc.Handle
     $readyWait = [System.Diagnostics.Stopwatch]::StartNew()
     while (-not (Test-Path $detReady) -and -not $detProc.HasExited -and $readyWait.ElapsedMilliseconds -lt 10000) {
         Start-Sleep -Milliseconds 10
@@ -124,6 +127,7 @@ try {
     }
 
     $rc = $detProc.ExitCode
+    if ($null -eq $rc) { throw "detector exit code unavailable -- no verdict" }
     # A failing detector observed contention directly. A clean detector needs an
     # independent proof that a publication completed before its sampling window ended.
     if ($rc -eq 0 -and -not $overlapObserved) {
