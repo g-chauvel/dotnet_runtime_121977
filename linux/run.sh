@@ -67,7 +67,6 @@ echo "seeded: $SEED_SIZE bytes"
 # silently disables itself below 2 CPUs). Without a profile the live phase would observe
 # nothing and "ATOMIC" would be vacuous.
 [ "$SEED_SIZE" -ge 64 ] || { echo "ERROR: no profile was seeded -- nothing to measure"; exit 1; }
-SEED_MTIME=$(stat -c%Y "$PROFILE")
 SEED_STATE=$(stat -c '%i:%s:%y' "$PROFILE")
 
 echo "== sanity: detector on the static (no-writer) profile, must report 0 =="
@@ -127,8 +126,7 @@ fi
 # The live phase must actually have republished the profile, whatever the runtime: a
 # missing or unchanged file means no successful atomic publication was measured.
 [ -f "$PROFILE" ] || { echo "ERROR: the profile disappeared during the live phase -- no verdict"; exit 1; }
-if [ "$(stat -c%Y "$PROFILE" 2>/dev/null || echo 0)" -eq "$SEED_MTIME" ] && \
-   [ "$(stat -c%s "$PROFILE" 2>/dev/null || echo 0)" -eq "$SEED_SIZE" ]; then
+if [ "$(stat -c '%i:%s:%y' "$PROFILE")" = "$SEED_STATE" ]; then
     echo "ERROR: the profile never changed during the live phase -- nothing was measured"
     exit 1
 fi
