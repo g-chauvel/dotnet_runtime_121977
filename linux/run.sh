@@ -94,11 +94,14 @@ fi
 # digits for %3N. Comparing epoch nanoseconds works with both implementations.
 end_ns=$(( $(date +%s%N) + DUR_MS * 1000000 ))
 overlap_observed=0
+writers_started=0
+writers_failed=0
 while (( $(date +%s%N) < end_ns )) && kill -0 "$det" 2>/dev/null; do
     pids=()
     for ((i=0; i<WRITERS; i++)); do
         LD_PRELOAD="$WORK/mcj_delay.so" MCJ_TARGET="$TARGET" WORKER_IDX=$i SLEEP_MS=20 \
             "$RUN" "$APP" >/dev/null 2>&1 & pids+=($!)
+        writers_started=$((writers_started + 1))
     done
     # Observe publication while writers are active: one slow writer must not hide a
     # faster writer's publication until after the detector's sampling window closes.
@@ -116,14 +119,19 @@ while (( $(date +%s%N) < end_ns )) && kill -0 "$det" 2>/dev/null; do
         [ "$writers_running" -eq 1 ] || break
         sleep 0.01
     done
-    # A writer may crash on the unpatched runtime (it replays a torn profile); that is
-    # an expected outcome here, not a script error, so do not let it trip 'set -e'.
-    for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done
+    # A crash can lose the shim's atexit report. Preserve an observed anomaly verdict,
+    # but never accept clean when a writer failed or its report may be missing.
+    for p in "${pids[@]}"; do
+        if ! wait "$p" 2>/dev/null; then
+            writers_failed=$((writers_failed + 1))
+        fi
+    done
 done
 # The detector exits 2 when it observes torn/incomplete (the control case): capture that
 # code instead of letting 'set -e' abort on it.
 rc=0; wait "$det" || rc=$?
 cat "$WORK/det.out"
+echo "writers: started=$writers_started, failed=$writers_failed"
 
 # Shim proof: on an unpatched runtime the writers' final-path fopen/fwrite hooks must have
 # fired; a fixed runtime writes only "*.tmp" paths and reports 0 hits (evaded by design).
@@ -133,7 +141,7 @@ shim_report_valid=0
 shim_open_hits=""
 shim_write_hits=""
 if [ -s "$MCJ_DELAY_REPORT" ]; then
-    if shim_counts=$(awk '
+    if shim_counts=$(awk -v expected="$writers_started" '
         /^open=[0-9]+ write=[0-9]+$/ {
             split($1, open, "="); split($2, write, "=")
             opens += open[2]; writes += write[2]; records++
@@ -141,7 +149,7 @@ if [ -s "$MCJ_DELAY_REPORT" ]; then
         }
         { malformed = 1 }
         END {
-            if (records == 0 || malformed) exit 1
+            if (records == 0 || records != expected || malformed) exit 1
             printf "%.0f %.0f\n", opens, writes
         }
     ' "$MCJ_DELAY_REPORT"); then
@@ -149,7 +157,7 @@ if [ -s "$MCJ_DELAY_REPORT" ]; then
         shim_report_valid=1
         echo "shim: final-path fopen hits=$shim_open_hits, delayed fwrites=$shim_write_hits (0 = the runtime never wrote the final path in place)"
     else
-        echo "shim: invalid report -- no clean verdict"
+        echo "shim: invalid or incomplete reports (expected $writers_started) -- no clean verdict"
     fi
 else
     echo "shim: no report (no writer reached the shim) -- no clean verdict"
@@ -165,6 +173,10 @@ fi
 
 case "$rc" in
     0)
+        if [ "$writers_failed" -ne 0 ]; then
+            echo "ERROR: $writers_failed writer(s) failed -- no clean verdict"
+            exit 1
+        fi
         if [ "$overlap_observed" -ne 1 ]; then
             echo "ERROR: no profile publication completed while the detector was running -- no verdict"
             exit 1

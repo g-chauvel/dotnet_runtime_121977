@@ -186,7 +186,16 @@ writer reports its shim hit counts (`shim: final-path fopen hits=N, delayed fwri
 they are nonzero on an unpatched runtime and `0` on a fixed one. The Linux driver accepts
 `RESULT: ATOMIC` only if it receives a valid report and both aggregate counters are zero,
 in addition to the detector and publication-overlap checks; a missing, malformed, or
-nonzero report is a harness error rather than a clean verdict.
+nonzero report is a harness error rather than a clean verdict. A clean Linux verdict
+also requires every writer to exit successfully and exactly one report per launched
+writer. A crash can bypass the shim's `atexit` handler, so a partial collection of zero
+reports cannot establish that all writers avoided the final path. An observed detector
+anomaly still returns `2`, even when a writer failed or reports are incomplete.
+
+Run `bash linux/test-writer-reports.sh` for synthetic driver-guard checks using a fake
+SDK/detector/writer host and the real shim. These check rejection of lost/extra/malformed
+reports and failed writers, and preservation of anomaly exit `2`; they do not build or
+test a .NET runtime.
 
 `app/Program.cs` reproduces what pwsh does: every process calls
 `ProfileOptimization.StartProfile` on the same file. Even writers producing identical bytes
@@ -220,9 +229,10 @@ is safe or that all startup crashes are fixed.
 
 - The detector validates record grammar, lengths, indexes and counts, but not semantic
   signature/metadata validity. A structurally valid corruption can escape it.
-- The drivers suppress writer output and intentionally ignore writer exit codes, so they
-  do not classify player crashes. Even though writers can replay a shared profile, that
-  replay is not independently checked by the harness.
+- The drivers suppress writer output and do not classify player crashes. Windows ignores
+  writer exit codes; Linux rejects failed writers when the detector would otherwise report
+  clean, while preserving an observed anomaly verdict. Even though writers can replay a
+  shared profile, that replay is not independently checked by the harness.
 - Each run uses **one runtime cohort**. The format bump rejects incompatible complete
   profiles but leaves the filename shared. Mixed patched/unpatched writers can still
   overwrite one another; this harness does not verify mixed-cohort safety.
