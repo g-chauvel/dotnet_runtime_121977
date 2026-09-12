@@ -8,6 +8,7 @@ $sdk = (Resolve-Path -LiteralPath $sdk).ProviderPath
 $work = Join-Path $env:TEMP ("mcj_held_checks_" + [IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $work | Out-Null
 $savedRoot = $env:DOTNET_ROOT
+try {
 Push-Location -LiteralPath (Join-Path $PSScriptRoot '..')
 try {
     # SDK selection searches from cwd, not from the absolute project path.
@@ -20,7 +21,6 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "detector build failed" }
 }
 finally {
-    $env:DOTNET_ROOT = $savedRoot
     Pop-Location
 }
 $env:MCJ_PROFILE_ROOT = Join-Path $work 'seed'
@@ -99,3 +99,7 @@ foreach ($case in @('none', 'legacy', 'posix')) {
     Write-Host "PASS: $case (exit $expected)"
 }
 Write-Host "work dir left at: $work"
+}
+finally {
+    $env:DOTNET_ROOT = $savedRoot
+}
