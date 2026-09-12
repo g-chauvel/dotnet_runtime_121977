@@ -14,10 +14,10 @@ using System.Threading;
 // MulticoreJitRecorder::WriteOutput writes the file in place (CREATE_ALWAYS, fragmented,
 // unlocked), so concurrent writers tear it and a starting process replays a corrupt profile.
 //
-// Two identical writers do NOT corrupt: interleaving identical bytes yields a valid file.
-// Corruption needs writers of DIFFERENT size, so a torn byte-merge leaves a valid header
-// over a mismatched body. This app maximizes that variance: even workers write a tiny
-// profile, odd workers a large one.
+// Even writers producing identical bytes can expose incomplete profiles on Unix while
+// an in-place writer truncates and repopulates the file. Different-sized profiles amplify
+// mismatched record streams but are not required for this publication defect. This app
+// increases that variance: even workers write a tiny profile, odd workers a large one.
 class Program
 {
     static int Main(string[] args)
@@ -51,8 +51,8 @@ class Program
         else
         {
             // MAXIMAL profile: many distinct methods across many assemblies -> large,
-            // many-fragment WriteOutput. The size delta vs the minimal workers is what
-            // makes an interleaved concurrent write corrupt rather than coincide.
+            // many-fragment WriteOutput. The size delta vs the minimal workers increases
+            // the chance of observing mismatched record streams during concurrent writes.
             acc += Regex.Matches("a1b2c3d4e5f6g7h8", "[0-9]").Count;
             acc += Regex.IsMatch("foo@bar.com", "^[^@]+@[^@]+$") ? 1 : 0;
             string json = JsonSerializer.Serialize(new { a = wi, b = new[] { 1, 2, 3, 4 }, c = "x", d = new { e = 5 } });

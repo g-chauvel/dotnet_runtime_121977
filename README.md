@@ -169,9 +169,11 @@ fopen hits=N, delayed fwrites=M`), nonzero on an unpatched runtime, `0` on a fix
 while the detector verdict flips from `NON-ATOMIC` to `ATOMIC` on the same workload.
 
 `app/Program.cs` reproduces what pwsh does: every process calls
-`ProfileOptimization.StartProfile` on the same file. Two *identical* writers don't corrupt
-(interleaving identical bytes yields a valid file), so workers deliberately write profiles
-of **different sizes** (even = tiny, odd = large) to maximize the torn-merge window.
+`ProfileOptimization.StartProfile` on the same file. Even writers producing identical bytes
+can expose incomplete profiles on Linux: an in-place writer truncates the file before
+repopulating it, and readers can observe that intermediate state. Workers deliberately
+write profiles of **different sizes** (even = tiny, odd = large) to amplify mismatched
+record streams; workload diversity is not a prerequisite for the publication defect.
 
 ## Files
 
