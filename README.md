@@ -123,6 +123,24 @@ DOTNET_ROOT=/path/to/a-runtime ./run.sh                             # exit 0: 0 
 $env:DOTNET_ROOT = "C:\path\to\a-runtime"; .\run.ps1                # exit 0: valid snapshots and successful held-reader publication
 ```
 
+### Reproducible Windows ARM64 build record
+
+`windows/build-runtime-arm64.ps1` is for the dedicated Windows ARM64 build host,
+not a desktop witness machine. It builds only `clr.runtime+clr.jit+clr.corelib` and
+records the selected SDK, source SHA, complete build output, and the native exit code.
+It rejects a repository-local `.dotnet` bootstrap because `global.json` would select it
+ahead of the explicitly supplied SDK:
+
+```powershell
+.\build-runtime-arm64.ps1 -RuntimeRepo C:\src\runtime `
+  -DotnetSdk C:\Tools\dotnet-sdk-11.0.100-rc.1.26420.103\dotnet.exe `
+  -Artifacts C:\temp\mcj-arm64-build `
+  -ExpectedCommit <runtime-commit>
+```
+
+The resulting runtime still needs to be assembled into an isolated `DOTNET_ROOT` layout
+before `run.ps1` tests it; the script never overwrites an installed SDK.
+
 ## How it works
 
 Each live sampling window defaults to 15 seconds. Total elapsed time also includes builds,
@@ -163,10 +181,12 @@ observes a non-atomic intermediate state"*:
   are harness errors.
 
 A runtime that writes to a private `*.tmp` file and publishes it with a rename
-never touches the final path mid-write, so it **evades the shim by construction** — and
-the driver prints the proof: each writer reports its shim hit counts (`shim: final-path
-fopen hits=N, delayed fwrites=M`), nonzero on an unpatched runtime, `0` on a fixed one,
-while the detector verdict flips from `NON-ATOMIC` to `ATOMIC` on the same workload.
+never touches the final path mid-write, so it **evades the shim by construction**. Each
+writer reports its shim hit counts (`shim: final-path fopen hits=N, delayed fwrites=M`):
+they are nonzero on an unpatched runtime and `0` on a fixed one. The Linux driver accepts
+`RESULT: ATOMIC` only if it receives a valid report and both aggregate counters are zero,
+in addition to the detector and publication-overlap checks; a missing, malformed, or
+nonzero report is a harness error rather than a clean verdict.
 
 `app/Program.cs` reproduces what pwsh does: every process calls
 `ProfileOptimization.StartProfile` on the same file. Even writers producing identical bytes
@@ -181,7 +201,8 @@ record streams; workload diversity is not a prerequisite for the publication def
 app/      Program.cs, mcjrepro.csproj    the repro app (one StartProfile per process), portable
 detector/ Detector.cs, detector.csproj   the reader-side detector, shared by both OSes
 linux/    mcj_delay.c, run.sh            LD_PRELOAD shim (C) + driver
-windows/  run.ps1, test-held-reader.ps1   driver + controlled publication checks
+windows/  run.ps1, test-held-reader.ps1, build-runtime-arm64.ps1
+          driver, controlled publication checks, and reproducible ARM64 build record
 ```
 
 The app and the default detector sampling mode are portable C#. The held-reader mode
@@ -206,8 +227,9 @@ is safe or that all startup crashes are fixed.
   profiles but leaves the filename shared. Mixed patched/unpatched writers can still
   overwrite one another; this harness does not verify mixed-cohort safety.
 - The Linux shim deliberately amplifies final-path in-place writes and excludes `*.tmp`
-  paths. Nonzero hit counts confirm that instrumentation fired; zero counts do not alone
-  establish publication success. The independent detector/publication checks are needed.
+  paths. A clean Linux result requires its valid zero-hit report, but that report alone
+  does not establish publication success. The independent detector/publication checks
+  are also required.
 - Windows replacement is tested with delete-sharing readers on the local test filesystem.
   Readers denying deletion, unsupported filesystems/APIs, and machine-crash durability
   are outside this test.
