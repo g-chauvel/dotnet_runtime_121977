@@ -127,10 +127,32 @@ cat "$WORK/det.out"
 
 # Shim proof: on an unpatched runtime the writers' final-path fopen/fwrite hooks must have
 # fired; a fixed runtime writes only "*.tmp" paths and reports 0 hits (evaded by design).
+# A clean verdict must have this proof: otherwise a final-path writer that happened not to
+# be sampled could be misclassified as atomic.
+shim_report_valid=0
+shim_open_hits=""
+shim_write_hits=""
 if [ -s "$MCJ_DELAY_REPORT" ]; then
-    awk -F'[= ]' '{o+=$2; w+=$4} END{printf "shim: final-path fopen hits=%d, delayed fwrites=%d (0 = the runtime never wrote the final path in place)\n", o, w}' "$MCJ_DELAY_REPORT"
+    if shim_counts=$(awk '
+        /^open=[0-9]+ write=[0-9]+$/ {
+            split($1, open, "="); split($2, write, "=")
+            opens += open[2]; writes += write[2]; records++
+            next
+        }
+        { malformed = 1 }
+        END {
+            if (records == 0 || malformed) exit 1
+            printf "%.0f %.0f\n", opens, writes
+        }
+    ' "$MCJ_DELAY_REPORT"); then
+        read -r shim_open_hits shim_write_hits <<<"$shim_counts"
+        shim_report_valid=1
+        echo "shim: final-path fopen hits=$shim_open_hits, delayed fwrites=$shim_write_hits (0 = the runtime never wrote the final path in place)"
+    else
+        echo "shim: invalid report -- no clean verdict"
+    fi
 else
-    echo "shim: no report (no writer reached the shim)"
+    echo "shim: no report (no writer reached the shim) -- no clean verdict"
 fi
 
 # The live phase must actually have republished the profile, whatever the runtime: a
@@ -145,6 +167,14 @@ case "$rc" in
     0)
         if [ "$overlap_observed" -ne 1 ]; then
             echo "ERROR: no profile publication completed while the detector was running -- no verdict"
+            exit 1
+        fi
+        if [ "$shim_report_valid" -ne 1 ]; then
+            echo "ERROR: no valid shim report -- no clean verdict"
+            exit 1
+        fi
+        if [ "$shim_open_hits" -ne 0 ] || [ "$shim_write_hits" -ne 0 ]; then
+            echo "ERROR: shim observed final-path writes -- no clean verdict"
             exit 1
         fi
         echo "RESULT: ATOMIC -- reader never observed a non-atomic profile (fixed)."
