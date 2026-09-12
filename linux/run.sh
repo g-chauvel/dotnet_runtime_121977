@@ -31,6 +31,9 @@ SDK="${DOTNET_SDK:-$(command -v dotnet)}"
 [ -x "$SDK" ] || { echo "no SDK (set DOTNET_SDK or put dotnet on PATH)"; exit 1; }
 if [ -n "${DOTNET_ROOT:-}" ]; then RUN="$DOTNET_ROOT/dotnet"; else RUN="$SDK"; fi
 [ -x "$RUN" ] || { echo "runtime host not found: $RUN"; exit 1; }
+# Preserve paths relative to the caller before the build changes directory for global.json.
+SDK="$(cd "$(dirname "$SDK")" && pwd)/$(basename "$SDK")"
+RUN="$(cd "$(dirname "$RUN")" && pwd)/$(basename "$RUN")"
 command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
 
 WORK="$(mktemp -d)"
@@ -43,6 +46,10 @@ export DOTNET_ROLL_FORWARD="${DOTNET_ROLL_FORWARD:-Major}"
 
 echo "== building repro app + detector (SDK: $SDK) =="
 ( unset DOTNET_ROOT
+  # SDK selection searches from cwd, not from the absolute project path.
+  # The subshell restores the caller's directory and DOTNET_ROOT on every exit.
+  cd "$HERE/.." || exit 1
+  "$SDK" --version || exit 1
   "$SDK" build -c Release "$APPPROJ" -o "$WORK/app" >/dev/null || exit 1
   "$SDK" build -c Release "$DETPROJ" -o "$WORK/det" >/dev/null || exit 1
 ) || { echo "build failed"; exit 1; }

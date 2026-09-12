@@ -3,13 +3,26 @@
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 3.0
 $sdk = if ($env:DOTNET_SDK) { $env:DOTNET_SDK } else { (Get-Command dotnet).Source }
+# Resolve relative SDK paths before entering the directory containing global.json.
+$sdk = (Resolve-Path -LiteralPath $sdk).ProviderPath
 $work = Join-Path $env:TEMP ("mcj_held_checks_" + [IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $work | Out-Null
-$env:DOTNET_ROOT = $null
-& $sdk build -c Release (Join-Path $PSScriptRoot '../app/mcjrepro.csproj') -o (Join-Path $work 'app') | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "app build failed" }
-& $sdk build -c Release (Join-Path $PSScriptRoot '../detector/detector.csproj') -o (Join-Path $work 'det') | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "detector build failed" }
+$savedRoot = $env:DOTNET_ROOT
+Push-Location -LiteralPath (Join-Path $PSScriptRoot '..')
+try {
+    # SDK selection searches from cwd, not from the absolute project path.
+    $env:DOTNET_ROOT = $null
+    & $sdk --version
+    if ($LASTEXITCODE -ne 0) { throw "SDK selection (global.json) failed" }
+    & $sdk build -c Release (Join-Path $PSScriptRoot '../app/mcjrepro.csproj') -o (Join-Path $work 'app') | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "app build failed" }
+    & $sdk build -c Release (Join-Path $PSScriptRoot '../detector/detector.csproj') -o (Join-Path $work 'det') | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "detector build failed" }
+}
+finally {
+    $env:DOTNET_ROOT = $savedRoot
+    Pop-Location
+}
 $env:MCJ_PROFILE_ROOT = Join-Path $work 'seed'
 $env:SLEEP_MS = '5'
 & $sdk (Join-Path $work 'app/mcjrepro.dll') 1

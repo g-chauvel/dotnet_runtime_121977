@@ -40,6 +40,9 @@ $sdk = if ($env:DOTNET_SDK) { $env:DOTNET_SDK } else { (Get-Command dotnet).Sour
 if (-not (Test-Path $sdk)) { Write-Error "no SDK (set DOTNET_SDK or put dotnet on PATH)"; exit 1 }
 $run = if ($env:DOTNET_ROOT) { Join-Path $env:DOTNET_ROOT "dotnet.exe" } else { $sdk }
 if (-not (Test-Path $run)) { Write-Error "runtime host not found: $run"; exit 1 }
+# Preserve paths relative to the caller before the build changes directory for global.json.
+$sdk = (Resolve-Path -LiteralPath $sdk).ProviderPath
+$run = (Resolve-Path -LiteralPath $run).ProviderPath
 
 $work = Join-Path $env:TEMP ("mcjrepro_" + [System.IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Force -Path $work | Out-Null
@@ -51,12 +54,21 @@ try {
 
     Write-Host "== building repro app + detector (SDK: $sdk) =="
     $savedRoot = $env:DOTNET_ROOT
-    $env:DOTNET_ROOT = $null
-    & $sdk build -c Release $appProj -o (Join-Path $work "app") | Out-Null
-    Assert-ExitOk "app build"
-    & $sdk build -c Release $detProj -o (Join-Path $work "det") | Out-Null
-    Assert-ExitOk "detector build"
-    $env:DOTNET_ROOT = $savedRoot
+    Push-Location -LiteralPath (Join-Path $here '..')
+    try {
+        # SDK selection searches from cwd, not from the absolute project path.
+        $env:DOTNET_ROOT = $null
+        & $sdk --version
+        Assert-ExitOk "SDK selection (global.json)"
+        & $sdk build -c Release $appProj -o (Join-Path $work "app") | Out-Null
+        Assert-ExitOk "app build"
+        & $sdk build -c Release $detProj -o (Join-Path $work "det") | Out-Null
+        Assert-ExitOk "detector build"
+    }
+    finally {
+        $env:DOTNET_ROOT = $savedRoot
+        Pop-Location
+    }
     $app = Join-Path $work "app\mcjrepro.dll"
     $det = Join-Path $work "det\detector.dll"
 
