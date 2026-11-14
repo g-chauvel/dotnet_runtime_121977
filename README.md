@@ -32,7 +32,8 @@ readers (and silently drops a second concurrent writer's update). The fix — wr
 private temp file, publish it with `rename(2)` (atomic by POSIX contract) on Linux and
 `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` on Windows — removes both: the final path is
 never opened for write, so Linux readers never see a torn profile and Windows readers are
-never refused. (The move is same-directory with no `MOVEFILE_COPY_ALLOWED`, so it cannot
+no longer refused by an in-place writer (a reader can still, rarely, be refused while a
+rename replaces the file). (The move is same-directory with no `MOVEFILE_COPY_ALLOWED`, so it cannot
 silently degrade to copy+delete; the Windows benefit rests on the final path never being
 write-opened, not on documented `MoveFileExW` atomicity.)
 
