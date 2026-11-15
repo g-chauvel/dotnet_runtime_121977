@@ -6,7 +6,9 @@
 # while a reader (Detector.cs) samples it, and counts what the reader observes.
 #
 #   exit 2  -> reader saw SHARING_VIOLATION (or torn/incomplete) = contention present (UNPATCHED)
-#   exit 0  -> reader was never blocked and always read a complete profile = FIXED
+#   exit 0  -> reader was never blocked by an in-place writer and always read a complete
+#              profile = FIXED (a rare ACCESS_DENIED while a rename replaces the file is
+#              reported, not counted: it is the fix's own transient)
 #   other   -> harness error (no profile seeded, no valid observation, no publication
 #              while the detector ran, detector died):
 #              NOT a pass; "nothing happened" must never report as "fixed".
@@ -156,7 +158,7 @@ try {
         throw "no profile publication completed while the detector was running -- no verdict"
     }
     switch ($rc) {
-        0       { Write-Host "RESULT: CLEAN -- reader never blocked, always read a complete profile (fixed)." }
+        0       { Write-Host "RESULT: CLEAN -- reader never blocked by an in-place writer, always read a complete profile (fixed)." }
         2       { Write-Host "RESULT: CONTENTION -- reader observed sharing violations / torn profile (unpatched)." }
         3       { Write-Host "ERROR: detector never managed a single valid read -- no verdict." }
         default { Write-Host "ERROR: detector failed (exit $rc) -- no verdict." }

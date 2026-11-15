@@ -37,6 +37,13 @@ rename replaces the file). (The move is same-directory with no `MOVEFILE_COPY_AL
 silently degrade to copy+delete; the Windows benefit rests on the final path never being
 write-opened, not on documented `MoveFileExW` atomicity.)
 
+Atomic publication alone does not repair a profile that is already torn: a process that
+crashes while replaying it exits before it records a new one, so the file stays and every
+start crashes. The fix therefore also bumps the profile format to version 103, whose header
+carries a checksum of the records. The player rejects a version 102 profile (possibly torn
+by an earlier runtime) and any profile whose records do not match the checksum, starts
+without replaying it, and the recorder replaces it at exit.
+
 This is why the two drivers measure different things:
 - **Linux** reproduces the actual defect (torn/incomplete reads) deterministically.
 - **Windows** demonstrates the reader contention (sharing violations). It does **not**
@@ -58,8 +65,9 @@ chmod +x run.sh
 ```
 Expected — the bug reproduces (exit 2; counts below are illustrative, they vary run to run):
 ```
-DETECTOR ... samples=2752648 OK=2600664 INCOMPLETE=151984 TORN=0 SHARING_VIOLATION=0 MISSING=0 ACCESS_DENIED=0 IO_ERROR=0
-shim: final-path fopen hits=12, delayed fwrites=44852 (0 = the runtime never wrote the final path in place)
+DETECTOR ... samples=2620759 OK=308627 INCOMPLETE=178556 TORN=2133576 SHARING_VIOLATION=0 MISSING=0 ACCESS_DENIED=0 IO_ERROR=0
+writers: started=24, failed=0
+shim: final-path fopen hits=24, delayed fwrites=49062 (0 = the runtime never wrote the final path in place)
 RESULT: NON-ATOMIC -- reader observed an incomplete/torn profile (bug present).
 ```
 
@@ -71,7 +79,8 @@ cd windows
 ```
 Expected — reader contention (exit 2): `SHARING_VIOLATION` > 0, `RESULT: CONTENTION`. Windows
 does not show torn reads (deny-share open refuses the concurrent reader instead) — see
-"Platform difference" above.
+"Platform difference" above. On a fixed runtime a few `ACCESS_DENIED` can appear (a reader
+opening the file while a rename replaces it). They are reported but do not fail the run.
 
 Tunables: `DUR_MS`/`WRITERS` (Linux env vars), `-DurationMs`/`-Writers` (Windows params).
 The app targets `net11.0` — the runtime whose profile write path is the CRT `fopen`/`fwrite`
@@ -118,8 +127,11 @@ observes a non-atomic intermediate state"*:
   shared profile in a tight loop, reads it whole and validates the complete record stream
   (record types and sizes, module indexes, header counts, exact end of file). It counts
   `INCOMPLETE` / `TORN` / `MISSING` (and, on Windows, `SHARING_VIOLATION` /
-  `ACCESS_DENIED`) observations.
-  Exits `2` if it ever sees one, `0` if every read was complete and valid, `3` if it never
+  `ACCESS_DENIED`) observations. `TORN` (a valid header over records that do not match it)
+  is the state that crashes the player. `INCOMPLETE` (shorter than the header) is rejected
+  by the player, but it still shows the in-place rewrite. `ACCESS_DENIED` is the
+  rename's own transient on Windows and is only reported.
+  Exits `2` if it ever sees one of the others, `0` if every read was complete and valid, `3` if it never
   got a single valid read, `1` on an unexpected I/O error (harness errors: "nothing
   happened" must not pass as "atomic"). The drivers start the writers only once the
   detector is ready.
@@ -156,15 +168,16 @@ Linux for that one file. Windows needs no native compiler — just a .NET SDK.
 The harness proves **writer-side atomicity**: with the fix, a reader can never observe a
 truncated or torn profile *being produced*. Two deliberate limits:
 
-- The detector validates the **record structure**, which is stricter than the runtime's
+- The detector validates the **record structure**, which is stricter than an unpatched
   player (it checks the header only, and that blindness is part of the bug). It does not
-  check semantic validity (method tokens, signatures), and it does not exercise the
-  player's replay path.
-- Each run tests **one runtime cohort**. A mixed fleet (one unpatched writer next to
-  patched processes sharing the same profile root) still tears the shared file, and a
-  patched reader will still replay it — writer atomicity protects a machine only once
-  every writer on it is patched. That is the argument for servicing backports, not
-  against the fix.
+  check semantic validity (method tokens, signatures) nor the version 103 checksum, and it
+  does not exercise the player's replay path.
+- Each run tests **one runtime cohort**. In a mixed fleet (an unpatched writer next to
+  patched processes sharing the same profile root), the unpatched writer still tears the
+  shared file in place. A patched reader rejects what it writes (version 102), and the
+  checksum rejects the remaining case: a version 103 profile truncated and rewritten by the
+  unpatched writer while a patched reader is reading it. The cost is that the two cohorts
+  stop replaying each other's profile while they share the path.
 
 ## The actual startup crash (Linux, for the original symptom)
 

@@ -17,16 +17,20 @@ using System.IO;
 //                       opened with plain fopen, which has no sharing semantics.
 //   MISSING           = the seeded final path disappeared during the live phase.
 //   ACCESS_DENIED     = the open was refused because the final path was being replaced
-//                       (Windows: a legacy rename leaves the old file delete-pending for a
-//                       moment). A refused reader, like SHARING_VIOLATION, not a torn one.
-// exit 2 if any non-atomic state was observed; 0 if every read was complete and valid; 1 for
-// an unexpected I/O error; 3 if it never managed a single valid read (no profile written at
-// all -- e.g. MulticoreJIT silently disabled below 2 CPUs): "nothing happened" must not pass.
+//                       (Windows: MoveFileExW leaves the old file delete-pending for a
+//                       moment). This is the rename-based fix's own transient, not an
+//                       in-place write: it is reported but does not count as non-atomic.
+// Exit codes:
+//   2 = a non-atomic state was observed (INCOMPLETE, TORN, SHARING_VIOLATION, MISSING)
+//   0 = every read was complete and valid
+//   1 = an unexpected I/O error
+//   3 = not a single valid read (no profile written at all, e.g. MulticoreJIT silently
+//       disabled below 2 CPUs): "nothing happened" must not pass.
 //
 // The structural validator mirrors the on-disk grammar in multicorejitimpl.h (record types,
 // sizes, alignment, module indexes, header counts, exact end of file). It accepts version
-// 102 and, should a fix bump the format, 103. It does not check semantic validity (see
-// README, "What this measures").
+// 102 and 103 (the fixed format). It does not check semantic validity, nor the checksum
+// that a version 103 header carries (see README, "What this measures").
 class Detector
 {
     const int HeaderSize = 64;
@@ -148,9 +152,11 @@ class Detector
             offset += recordLength;
         }
 
+        // methods may exceed the header count: the recorder writes the record of a skipped
+        // async-variant method (with token 0) but does not count it in methodCount.
         return offset == profile.Length &&
                modules == expectedModules &&
-               methods == expectedMethods &&
+               methods >= expectedMethods &&
                dependencies == expectedDependencies;
     }
 
@@ -209,8 +215,9 @@ class Detector
         // An unexpected I/O error is a harness failure, not evidence for either verdict.
         if (ioErrors > 0) return 1;
         // The profile is seeded before sampling starts, so a missing observation is also
-        // a non-atomic state rather than an expected startup race.
-        if (incomplete + torn + sharing + missing + denied > 0) return 2;
+        // a non-atomic state rather than an expected startup race. ACCESS_DENIED is left
+        // out on purpose (see the header comment).
+        if (incomplete + torn + sharing + missing > 0) return 2;
         // Exit 0 must mean "writes were observed and were atomic", not "nothing happened".
         if (ok == 0) return 3;
         return 0;
