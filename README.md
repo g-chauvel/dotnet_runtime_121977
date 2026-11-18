@@ -68,6 +68,7 @@ Expected — the bug reproduces (exit 2; counts below are illustrative, they var
 DETECTOR ... samples=2620759 OK=308627 INCOMPLETE=178556 TORN=2133576 SHARING_VIOLATION=0 MISSING=0 ACCESS_DENIED=0 IO_ERROR=0
 writers: started=24, failed=0
 shim: final-path fopen hits=24, delayed fwrites=49062 (0 = the runtime never wrote the final path in place)
+shim: *.tmp opens=0, writers without one=24
 RESULT: NON-ATOMIC -- reader observed an incomplete/torn profile (bug present).
 ```
 
@@ -101,7 +102,7 @@ assembled per
 [using-your-build-with-installed-sdk.md](https://github.com/dotnet/runtime/blob/main/docs/workflow/testing/using-your-build-with-installed-sdk.md):
 
 ```sh
-DOTNET_ROOT=/path/to/a-runtime ./run.sh                             # exit 0: 0 torn reads, 0 shim hits
+DOTNET_ROOT=/path/to/a-runtime ./run.sh                             # exit 0: 0 torn reads, 0 final-path shim hits
 ```
 ```powershell
 $env:DOTNET_ROOT = "C:\path\to\a-runtime"; .\run.ps1                # exit 0: 0 sharing violations
@@ -122,10 +123,12 @@ observes a non-atomic intermediate state"*:
   syscall wrappers would silently never fire. The `fwrite` delays stretch the gaps
   between the stdio buffer's flushes to disk, where the torn states live. The in-place
   rewrite tears without the shim too (truncate + buffered ~4 KiB flushes of a tens-of-KB
-  body); the shim just makes the windows wide enough to be sampled reliably.
+  body); the shim just makes the windows wide enough to be sampled reliably. It also
+  counts, without delaying them, the write-mode opens of the target's `*.tmp` files.
 - **`detector/Detector.cs`** — one C# reader loop, shared by both OSes, that opens the
   shared profile in a tight loop, reads it whole and validates the complete record stream
-  (record types and sizes, module indexes, header counts, exact end of file). It counts
+  (record types and sizes, module indexes, header counts, exact end of file, and for
+  version 103 the checksum of the records, as the player does). It counts
   `INCOMPLETE` / `TORN` / `MISSING` (and, on Windows, `SHARING_VIOLATION` /
   `ACCESS_DENIED`) observations. `TORN` (a valid header over records that do not match it)
   is the state that crashes the player. `INCOMPLETE` (shorter than the header) is rejected
@@ -142,7 +145,8 @@ the driver prints the proof: each writer reports its shim hit counts (`shim: fin
 fopen hits=N, delayed fwrites=M`), nonzero on an unpatched runtime, `0` on a fixed one,
 while the detector verdict flips from `NON-ATOMIC` to `ATOMIC` on the same workload. The
 Linux driver reports `ATOMIC` only if every writer exited successfully and left a
-zero-hit report.
+zero-hit report in which the shim saw its `*.tmp` open (`shim: *.tmp opens=N, writers
+without one=0`): zero hits from a shim that sees nothing are not a proof.
 
 `app/Program.cs` reproduces what pwsh does: every process calls
 `ProfileOptimization.StartProfile` on the same file. Even *identical* writers expose an
@@ -170,8 +174,8 @@ truncated or torn profile *being produced*. Two deliberate limits:
 
 - The detector validates the **record structure**, which is stricter than an unpatched
   player (it checks the header only, and that blindness is part of the bug). It does not
-  check semantic validity (method tokens, signatures) nor the version 103 checksum, and it
-  does not exercise the player's replay path.
+  check semantic validity (method tokens, signatures), and it does not exercise the
+  player's replay path.
 - Each run tests **one runtime cohort**. In a mixed fleet (an unpatched writer next to
   patched processes sharing the same profile root), the unpatched writer still tears the
   shared file in place. A patched reader rejects what it writes (version 102), and the

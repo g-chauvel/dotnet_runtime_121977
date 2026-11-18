@@ -15,9 +15,12 @@
 //   - after fopen("w...") of the final path -> sleep (widen the truncated, size-0 window)
 //   - after each fwrite() to that stream    -> sleep (widen the partial-body windows)
 //
-// If MCJ_DELAY_REPORT names a file, each process appends its hook hit counts to it at
-// exit, so the driver can prove the shim fired (control: hits > 0) or was evaded by
-// construction (fix: 0 hits, every write goes to a "*.tmp" path).
+// It also counts, without delaying them, the write-mode opens of the target's "*.tmp" files.
+// If MCJ_DELAY_REPORT names a file, each process appends its counts to it at exit, so the
+// driver can prove the shim fired (control: final-path hits > 0) or was evaded by
+// construction (fix: 0 final-path hits, and the shim saw the "*.tmp" open of every writer,
+// which a shim that sees nothing, such as one on a runtime that bypasses these entry
+// points, would not report).
 // build: gcc -O2 -shared -fPIC mcj_delay.c -o mcj_delay.so -ldl
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -40,14 +43,14 @@ static pthread_mutex_t tracked_lock = PTHREAD_MUTEX_INITIALIZER;
 static const char* target = "StartupProfileData-Repro";
 static int delay_open_us  = 5000;   // size-0 window after the truncating open
 static int delay_write_us = 2000;   // partial window between buffer flushes
-static unsigned long hits_open = 0, hits_write = 0;
+static unsigned long hits_open = 0, hits_write = 0, hits_tmp = 0;
 
 static void report(void){
     const char* path = getenv("MCJ_DELAY_REPORT");
     if (!path || !*path || !real_fopen || !real_fclose) return;
     FILE* f = real_fopen(path, "a");
     if (!f) return;
-    fprintf(f, "open=%lu write=%lu\n", hits_open, hits_write);
+    fprintf(f, "open=%lu write=%lu tmp=%lu\n", hits_open, hits_write, hits_tmp);
     real_fclose(f);
 }
 
@@ -68,13 +71,14 @@ static void init(void){ pthread_once(&once, init_once); }
 // usleep may clobber errno; the interposed function's caller must see the real call's errno.
 static void sleep_keep_errno(int us){ int e = errno; usleep(us); errno = e; }
 
-// final profile path = basename contains target AND does not end in ".tmp"
-static int is_final_target(const char* path){
+// 0 = not the target, 1 = final profile path (basename contains target and does not end
+// in ".tmp"), 2 = one of its temp files (basename contains target and ends in ".tmp")
+static int target_kind(const char* path){
     if (!path) return 0;
     const char* b = strrchr(path, '/'); b = b ? b + 1 : path;
     if (!strstr(b, target)) return 0;
     size_t bl = strlen(b);
-    if (bl >= 4 && strcmp(b + bl - 4, ".tmp") == 0) return 0;
+    if (bl >= 4 && strcmp(b + bl - 4, ".tmp") == 0) return 2;
     return 1;
 }
 
@@ -97,10 +101,16 @@ static void untrack(FILE* f){
 }
 
 static FILE* after_fopen(FILE* f, const char* path, const char* mode){
-    if (f && mode && mode[0] == 'w' && is_final_target(path)){
+    if (!f || !mode || mode[0] != 'w') return f;
+    switch (target_kind(path)){
+    case 1:
         track(f);
         __sync_fetch_and_add(&hits_open, 1);
         sleep_keep_errno(delay_open_us);
+        break;
+    case 2:
+        __sync_fetch_and_add(&hits_tmp, 1);
+        break;
     }
     return f;
 }

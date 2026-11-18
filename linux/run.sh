@@ -70,7 +70,9 @@ echo "seeded: $SEED_SIZE bytes"
 SEED_STATE=$(stat -c '%i:%s:%y' "$PROFILE")
 
 echo "== sanity: detector on the static (no-writer) profile, must report 0 =="
-"$RUN" "$DET" "$PROFILE" 800
+# Under 'set -e' a failing sanity would exit with the detector's code, and 2 would read as
+# "bug present" without any writer having run.
+"$RUN" "$DET" "$PROFILE" 800 || { echo "ERROR: the detector rejected the seeded profile -- no verdict"; exit 1; }
 
 echo "== live: detector + $WRITERS concurrent delayed writers for ${DUR_MS}ms =="
 export MCJ_DELAY_REPORT="$WORK/shim_report"
@@ -136,26 +138,32 @@ echo "writers: started=$writers_started, failed=$writers_failed"
 # Shim proof: on an unpatched runtime the writers' final-path fopen/fwrite hooks must have
 # fired; a fixed runtime writes only "*.tmp" paths and reports 0 hits (evaded by design).
 # A clean verdict must have this proof: otherwise a final-path writer that happened not to
-# be sampled could be misclassified as atomic.
+# be sampled could be misclassified as atomic. 0 hits alone could also come from a shim
+# that sees nothing, so a clean verdict also needs the shim to have seen the "*.tmp" open
+# of every writer.
 shim_report_valid=0
 shim_open_hits=""
 shim_write_hits=""
+shim_tmp_opens=""
+shim_writers_without_tmp=""
 if [ -s "$MCJ_DELAY_REPORT" ]; then
     if shim_counts=$(awk -v expected="$writers_started" '
-        /^open=[0-9]+ write=[0-9]+$/ {
-            split($1, open, "="); split($2, write, "=")
-            opens += open[2]; writes += write[2]; records++
+        /^open=[0-9]+ write=[0-9]+ tmp=[0-9]+$/ {
+            split($1, open, "="); split($2, write, "="); split($3, tmp, "=")
+            opens += open[2]; writes += write[2]; tmps += tmp[2]; records++
+            if (tmp[2] == 0) untmp++
             next
         }
         { malformed = 1 }
         END {
             if (records == 0 || records != expected || malformed) exit 1
-            printf "%.0f %.0f\n", opens, writes
+            printf "%.0f %.0f %.0f %.0f\n", opens, writes, tmps, untmp
         }
     ' "$MCJ_DELAY_REPORT"); then
-        read -r shim_open_hits shim_write_hits <<<"$shim_counts"
+        read -r shim_open_hits shim_write_hits shim_tmp_opens shim_writers_without_tmp <<<"$shim_counts"
         shim_report_valid=1
         echo "shim: final-path fopen hits=$shim_open_hits, delayed fwrites=$shim_write_hits (0 = the runtime never wrote the final path in place)"
+        echo "shim: *.tmp opens=$shim_tmp_opens, writers without one=$shim_writers_without_tmp"
     else
         echo "shim: invalid or incomplete reports (expected $writers_started) -- no clean verdict"
     fi
@@ -187,6 +195,10 @@ case "$rc" in
         fi
         if [ "$shim_open_hits" -ne 0 ] || [ "$shim_write_hits" -ne 0 ]; then
             echo "ERROR: shim observed final-path writes -- no clean verdict"
+            exit 1
+        fi
+        if [ "$shim_writers_without_tmp" -ne 0 ]; then
+            echo "ERROR: the shim saw no *.tmp open for $shim_writers_without_tmp writer(s) -- no clean verdict"
             exit 1
         fi
         echo "RESULT: ATOMIC -- reader never observed a non-atomic profile (fixed)."

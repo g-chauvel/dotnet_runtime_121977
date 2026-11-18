@@ -2,6 +2,7 @@ using System;
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.IO;
+using System.Numerics;
 
 // Reader-side detector for dotnet/runtime#121977, shared by the Linux and Windows runners.
 // The fix's contract is "a reader never observes a non-atomic intermediate state", so this
@@ -27,10 +28,11 @@ using System.IO;
 //   3 = not a single valid read (no profile written at all, e.g. MulticoreJIT silently
 //       disabled below 2 CPUs): "nothing happened" must not pass.
 //
-// The structural validator mirrors the on-disk grammar in multicorejitimpl.h (record types,
-// sizes, alignment, module indexes, header counts, exact end of file). It accepts version
-// 102 and 103 (the fixed format). It does not check semantic validity, nor the checksum
-// that a version 103 header carries (see README, "What this measures").
+// The validator mirrors the on-disk grammar in multicorejitimpl.h (record types, sizes,
+// alignment, module indexes, header counts, exact end of file). It accepts version 102 and
+// 103 (the fixed format), and checks the checksum of the records that a version 103 header
+// carries, as the player does. It does not check semantic validity (see README, "What this
+// measures").
 class Detector
 {
     const int HeaderSize = 64;
@@ -53,6 +55,33 @@ class Detector
 
     static int Align4(int value) => (value + 3) & ~3;
 
+    // HashBytes (src/coreclr/inc/utilcode.h): xxHash rounds over little-endian 32-bit words,
+    // the last one zero-padded, with no seed. A version 103 header stores it, computed over
+    // everything after the header, at offset 8.
+    static uint HashBytes(ReadOnlySpan<byte> data)
+    {
+        const uint Prime2 = 2246822519U, Prime3 = 3266489917U, Prime4 = 668265263U;
+        unchecked
+        {
+            uint hash = 5381u + (uint)data.Length;
+            for (; data.Length >= sizeof(uint); data = data.Slice(sizeof(uint)))
+                hash = BitOperations.RotateLeft(hash + BinaryPrimitives.ReadUInt32LittleEndian(data) * Prime3, 17) * Prime4;
+            if (data.Length > 0)
+            {
+                uint last = 0;
+                for (int i = 0; i < data.Length; i++)
+                    last |= (uint)data[i] << (8 * i);
+                hash = BitOperations.RotateLeft(hash + last * Prime3, 17) * Prime4;
+            }
+            hash ^= hash >> 15;
+            hash *= Prime2;
+            hash ^= hash >> 13;
+            hash *= Prime3;
+            hash ^= hash >> 16;
+            return hash;
+        }
+    }
+
     static bool IsStructurallyValidProfile(ReadOnlySpan<byte> profile)
     {
         // A header-only profile (no modules, no methods) is valid: the counts decide below.
@@ -68,6 +97,13 @@ class Detector
         if (headerRecordId != 0x01000040u ||
             (version != LegacyProfileVersion && version != BumpedProfileVersion) ||
             expectedModules > MaxModules || expectedMethods > MaxMethods)
+        {
+            return false;
+        }
+
+        // The player rejects a version 103 profile whose records do not match the checksum.
+        if (version == BumpedProfileVersion &&
+            HashBytes(profile.Slice(HeaderSize)) != BinaryPrimitives.ReadUInt32LittleEndian(profile.Slice(8)))
         {
             return false;
         }
