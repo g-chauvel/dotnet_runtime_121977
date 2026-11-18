@@ -138,7 +138,7 @@ while (( $(date +%s%N) < end_ns )) && kill -0 "$det" 2>/dev/null; do
     pids=()
     for ((i=0; i<WRITERS; i++)); do
         LD_PRELOAD="$WORK/mcj_delay.so" MCJ_TARGET="$TARGET" WORKER_IDX=$i SLEEP_MS=20 \
-            "$RUN" "$APP" >/dev/null 2>&1 & pids+=($!)
+            "$RUN" "$APP" >/dev/null 2>>"$WORK/writers.err" & pids+=($!)
         writers_started=$((writers_started + 1))
     done
     # Observe publication while writers are active: one slow writer must not hide a
@@ -207,6 +207,11 @@ if [ -s "$MCJ_DELAY_REPORT" ]; then
     fi
 else
     echo "shim: no report (no writer reached the shim) -- no clean verdict"
+fi
+# The loader reports there why it could not load the shim (for example a noexec $TMPDIR).
+if [ "$shim_report_valid" -ne 1 ] && [ -s "$WORK/writers.err" ]; then
+    echo "writers stderr (last lines, full log: $WORK/writers.err):"
+    tail -n 5 "$WORK/writers.err"
 fi
 
 # The live phase must actually have republished the profile, whatever the runtime: a

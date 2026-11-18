@@ -53,8 +53,8 @@ On both OSes a run in which the detector misses every window exits `1`, never `0
 
 ## Reproduce it
 
-To reproduce, you need a **.NET SDK that can target `net11.0`** (a .NET 11 preview SDK,
-the app's target framework), with `dotnet` on `PATH`. On Linux you also need `gcc` (for
+To reproduce, you need a **.NET SDK that can target `net11.0`** (a .NET 11 SDK, for the
+target framework of the app and the detector), with `dotnet` on `PATH`. On Linux you also need `gcc` (for
 the single native shim file), glibc and GNU coreutils or uutils (Ubuntu, Debian, Fedora,
 not Alpine/BusyBox). Windows needs no native compiler. Clone the repository and run the
 driver for your OS.
@@ -82,6 +82,9 @@ RESULT: NON-ATOMIC -- reader observed an incomplete/torn profile (bug present).
 cd windows
 .\run.ps1
 ```
+Where the execution policy does not allow local scripts (the default of Windows PowerShell
+5.1 on a client), run `powershell -ExecutionPolicy Bypass -File .\run.ps1` instead.
+
 Expected: reader contention (exit 2, also in `$LASTEXITCODE` when run as `.\run.ps1`),
 `SHARING_VIOLATION` > 0, `RESULT: CONTENTION`. Windows does not show torn reads (the
 deny-share open refuses the concurrent reader instead), see "Platform difference" above.
@@ -90,9 +93,10 @@ rename replaces it). They are reported but do not fail the run.
 
 Tunables: `DUR_MS`/`WRITERS` (Linux env vars), `-DurationMs`/`-Writers` (Windows params).
 The app targets `net11.0`, the runtime whose profile write path is the CRT `fopen`/`fwrite`
-the shim hooks. On an older SDK you can lower `<TargetFramework>` in `app/mcjrepro.csproj`
-(net10/9/8): the in-place corruption still reproduces (INCOMPLETE/TORN from the natural
-window), but the `shim:` hit counts stay 0, because pre-net11 runtimes write the profile
+the shim hooks. For a runtime under test older than .NET 11, or an older SDK, lower
+`<TargetFramework>` in both `app/mcjrepro.csproj` and `detector/detector.csproj` (net10/9/8,
+both run on that runtime): the in-place corruption still reproduces (INCOMPLETE/TORN from the
+natural window), but the `shim:` hit counts stay 0, because pre-net11 runtimes write the profile
 through a different path. Without the shim the window is narrow: a run that misses it exits
 `1`, not `0`.
 
