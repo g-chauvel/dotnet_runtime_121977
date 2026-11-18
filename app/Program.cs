@@ -22,6 +22,12 @@ class Program
 {
     static int Main(string[] args)
     {
+        // The drivers ask the seed run which runtime actually ran, so that a stray DOTNET_ROOT
+        // cannot go unnoticed.
+        if (Environment.GetEnvironmentVariable("MCJ_PRINT_RUNTIME") == "1")
+            Console.WriteLine($"runtime: {System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription} " +
+                              $"from {Path.GetDirectoryName(typeof(object).Assembly.Location)}");
+
         // Shared profile root. Defaults to ~/.cache/mcjrepro (pwsh-like); override with
         // MCJ_PROFILE_ROOT so the harness can point every worker at one directory.
         string root = Environment.GetEnvironmentVariable("MCJ_PROFILE_ROOT");

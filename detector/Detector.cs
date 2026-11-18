@@ -202,7 +202,7 @@ class Detector
         string path = args[0];
         long dur = long.Parse(args[1]);
         byte[] buf = new byte[64 * 1024];
-        long samples = 0, ok = 0, incomplete = 0, torn = 0, sharing = 0, missing = 0, denied = 0, ioErrors = 0;
+        long samples = 0, ok = 0, ok102 = 0, ok103 = 0, incomplete = 0, torn = 0, sharing = 0, missing = 0, denied = 0, ioErrors = 0;
 
         // Let the driver start writers only after the detector is initialized. The
         // ready file is optional so the detector remains convenient to run by hand.
@@ -236,6 +236,7 @@ class Detector
                 if (n != expectedLength || fs.ReadByte() != -1) { torn++; continue; }
                 if (!IsStructurallyValidProfile(buf.AsSpan(0, n))) { torn++; continue; }
                 ok++;
+                if (BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(4)) == LegacyProfileVersion) ok102++; else ok103++;
             }
             catch (FileNotFoundException) { missing++; }
             catch (DirectoryNotFoundException) { missing++; }
@@ -247,7 +248,7 @@ class Detector
                 else ioErrors++;
             }
         }
-        Console.WriteLine($"DETECTOR path={path} dur={dur}ms samples={samples} OK={ok} INCOMPLETE={incomplete} TORN={torn} SHARING_VIOLATION={sharing} MISSING={missing} ACCESS_DENIED={denied} IO_ERROR={ioErrors}");
+        Console.WriteLine($"DETECTOR path={path} dur={dur}ms samples={samples} OK={ok} (version 102={ok102}, 103={ok103}) INCOMPLETE={incomplete} TORN={torn} SHARING_VIOLATION={sharing} MISSING={missing} ACCESS_DENIED={denied} IO_ERROR={ioErrors}");
         // An unexpected I/O error is a harness failure, not evidence for either verdict.
         if (ioErrors > 0) return 1;
         // The profile is seeded before sampling starts, so a missing observation is also

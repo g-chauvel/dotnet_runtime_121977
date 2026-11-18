@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Deterministic reproduction of dotnet/runtime#121977 against ONE runtime (Linux).
+# Reproduction of dotnet/runtime#121977 against ONE runtime (Linux).
 #
 # Builds the repro app + an LD_PRELOAD write-delay shim + a torn-read detector, then
 # runs N concurrent writers (under the shim) against ONE shared profile while the
 # detector samples it.
 #
-#   exit 2  -> INCOMPLETE/TORN/MISSING observed = bug present (an UNPATCHED runtime)
-#   exit 0  -> profile always complete+valid = atomic (a FIXED runtime)
+#   exit 2  -> INCOMPLETE/TORN/MISSING observed and the profile is still the seeded file
+#              = bug present (an UNPATCHED runtime)
+#   exit 0  -> profile always complete+valid, every writer wrote a *.tmp and never the final
+#              path, and the profile at the end is a different inode than the seeded one
+#              (published by rename) = atomic (a FIXED runtime)
 #   other   -> harness error (no profile seeded, no valid observation, detector died):
 #              NOT a pass; "nothing happened" must never report as "atomic".
 #
@@ -27,7 +30,7 @@ DUR_MS="${DUR_MS:-15000}"
 WRITERS="${WRITERS:-12}"
 TARGET="StartupProfileData-Repro"
 
-SDK="${DOTNET_SDK:-$(command -v dotnet)}"
+SDK="${DOTNET_SDK:-$(command -v dotnet || true)}"
 [ -x "$SDK" ] || { echo "no SDK (set DOTNET_SDK or put dotnet on PATH)"; exit 1; }
 if [ -n "${DOTNET_ROOT:-}" ]; then RUN="$DOTNET_ROOT/dotnet"; else RUN="$SDK"; fi
 [ -x "$RUN" ] || { echo "runtime host not found: $RUN"; exit 1; }
@@ -39,6 +42,12 @@ command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
 WORK="$(mktemp -d)"
 # Left in place on purpose (a throwaway dir under $TMPDIR); delete it yourself when done.
 trap 'echo "work dir left at: $WORK"' EXIT
+# On Ctrl+C, stop the detector and the writers too: background jobs of a script ignore SIGINT.
+trap 'kill $(jobs -p) 2>/dev/null || true; exit 130' INT TERM
+# ld.so splits LD_PRELOAD on spaces and colons: the shim would silently not load.
+case "$WORK" in
+    *[[:space:]:]*) echo "ERROR: the work dir contains a space or ':' (set TMPDIR to a path without them)"; exit 1 ;;
+esac
 export MCJ_PROFILE_ROOT="$WORK/cache"
 PROFILE="$MCJ_PROFILE_ROOT/$TARGET"
 export DOTNET_MULTILEVEL_LOOKUP=0 DOTNET_NOLOGO=1 DOTNET_CLI_TELEMETRY_OPTOUT=1
@@ -50,9 +59,10 @@ echo "== building repro app + detector (SDK: $SDK) =="
   # The subshell restores the caller's directory and DOTNET_ROOT on every exit.
   cd "$HERE/.." || exit 1
   "$SDK" --version || exit 1
-  "$SDK" build -c Release "$APPPROJ" -o "$WORK/app" >/dev/null || exit 1
-  "$SDK" build -c Release "$DETPROJ" -o "$WORK/det" >/dev/null || exit 1
-) || { echo "build failed"; exit 1; }
+  # No MSBuild node or compiler server left running after the harness.
+  "$SDK" build -c Release --disable-build-servers "$APPPROJ" -o "$WORK/app" > "$WORK/build-app.log" 2>&1 || exit 1
+  "$SDK" build -c Release --disable-build-servers "$DETPROJ" -o "$WORK/det" > "$WORK/build-det.log" 2>&1 || exit 1
+) || { tail -n 30 "$WORK"/build-*.log; echo "build failed (logs: $WORK/build-*.log)"; exit 1; }
 APP="$WORK/app/mcjrepro.dll"
 DET="$WORK/det/detector.dll"
 echo "== building LD_PRELOAD shim (gcc) =="
@@ -60,7 +70,8 @@ gcc -O2 -shared -fPIC "$HERE/mcj_delay.c" -o "$WORK/mcj_delay.so" -ldl || exit 1
 
 echo "== runtime under test: $RUN =="
 echo "== seeding a valid profile (no shim) =="
-WORKER_IDX=1 SLEEP_MS=5 "$RUN" "$APP" >/dev/null 2>&1 || { echo "seed run failed"; exit 1; }
+MCJ_PRINT_RUNTIME=1 WORKER_IDX=1 SLEEP_MS=5 "$RUN" "$APP" > "$WORK/seed.out" 2>&1 || { cat "$WORK/seed.out"; echo "seed run failed"; exit 1; }
+cat "$WORK/seed.out"
 SEED_SIZE=$(stat -c%s "$PROFILE" 2>/dev/null || echo 0)
 echo "seeded: $SEED_SIZE bytes"
 # A profile smaller than its 64-byte header means MulticoreJIT never wrote one (e.g. it
@@ -68,6 +79,11 @@ echo "seeded: $SEED_SIZE bytes"
 # nothing and "ATOMIC" would be vacuous.
 [ "$SEED_SIZE" -ge 64 ] || { echo "ERROR: no profile was seeded -- nothing to measure"; exit 1; }
 SEED_STATE=$(stat -c '%i:%s:%y' "$PROFILE")
+SEED_INODE=$(stat -c '%i' "$PROFILE")
+# Keep the seeded file open until the verdict: once a rename replaces it, the file system
+# could otherwise give its inode number to a later file (ext4 does), and the final profile
+# would look like the seeded one rewritten in place.
+exec 3<"$PROFILE"
 
 echo "== sanity: detector on the static (no-writer) profile, must report 0 =="
 # Under 'set -e' a failing sanity would exit with the detector's code, and 2 would read as
@@ -76,6 +92,8 @@ echo "== sanity: detector on the static (no-writer) profile, must report 0 =="
 
 echo "== live: detector + $WRITERS concurrent delayed writers for ${DUR_MS}ms =="
 export MCJ_DELAY_REPORT="$WORK/shim_report"
+# An unpatched writer can crash on a torn profile: keep its core dump off the machine.
+ulimit -c 0
 READY="$WORK/det.ready"
 "$RUN" "$DET" "$PROFILE" "$DUR_MS" "$READY" > "$WORK/det.out" 2>&1 &
 det=$!
@@ -95,6 +113,24 @@ fi
 # uutils date shipped by Ubuntu 26.04 currently emits all nine nanosecond
 # digits for %3N. Comparing epoch nanoseconds works with both implementations.
 end_ns=$(( $(date +%s%N) + DUR_MS * 1000000 ))
+# A process still running this long after the sampling window is stuck: no verdict.
+deadline_ns=$(( end_ns + 60 * 1000000000 ))
+wait_or_give_up() { # pids...
+    local p running
+    while :; do
+        running=0
+        for p in "$@"; do
+            if kill -0 "$p" 2>/dev/null; then running=1; break; fi
+        done
+        [ "$running" -eq 1 ] || return 0
+        if (( $(date +%s%N) > deadline_ns )); then
+            kill -9 "$@" "$det" 2>/dev/null || true
+            echo "ERROR: a process did not exit -- no verdict"
+            exit 1
+        fi
+        sleep 0.05
+    done
+}
 overlap_observed=0
 writers_started=0
 writers_failed=0
@@ -123,6 +159,7 @@ while (( $(date +%s%N) < end_ns )) && kill -0 "$det" 2>/dev/null; do
     done
     # A crash can lose the shim's atexit report. Preserve an observed anomaly verdict,
     # but never accept clean when a writer failed or its report may be missing.
+    wait_or_give_up "${pids[@]}"
     for p in "${pids[@]}"; do
         if ! wait "$p" 2>/dev/null; then
             writers_failed=$((writers_failed + 1))
@@ -131,6 +168,7 @@ while (( $(date +%s%N) < end_ns )) && kill -0 "$det" 2>/dev/null; do
 done
 # The detector exits 2 when it observes torn/incomplete (the control case): capture that
 # code instead of letting 'set -e' abort on it.
+wait_or_give_up "$det"
 rc=0; wait "$det" || rc=$?
 cat "$WORK/det.out"
 echo "writers: started=$writers_started, failed=$writers_failed"
@@ -178,6 +216,9 @@ if [ "$(stat -c '%i:%s:%y' "$PROFILE")" = "$SEED_STATE" ]; then
     echo "ERROR: the profile never changed during the live phase -- nothing was measured"
     exit 1
 fi
+FINAL_INODE=$(stat -c '%i' "$PROFILE")
+exec 3<&-
+echo "profile inode: seeded=$SEED_INODE, final=$FINAL_INODE (unchanged = rewritten in place)"
 
 case "$rc" in
     0)
@@ -201,9 +242,20 @@ case "$rc" in
             echo "ERROR: the shim saw no *.tmp open for $shim_writers_without_tmp writer(s) -- no clean verdict"
             exit 1
         fi
+        if [ "$FINAL_INODE" = "$SEED_INODE" ]; then
+            echo "ERROR: the profile is still the seeded file, rewritten in place -- no clean verdict"
+            exit 1
+        fi
         echo "RESULT: ATOMIC -- reader never observed a non-atomic profile (fixed)."
         ;;
-    2) echo "RESULT: NON-ATOMIC -- reader observed an incomplete/torn profile (bug present)." ;;
+    2)
+        # An unpatched runtime rewrites the seeded file: a new file contradicts the observation.
+        if [ "$FINAL_INODE" != "$SEED_INODE" ]; then
+            echo "ERROR: torn reads observed, but the profile was published by rename -- no verdict"
+            exit 1
+        fi
+        echo "RESULT: NON-ATOMIC -- reader observed an incomplete/torn profile (bug present)."
+        ;;
     3) echo "ERROR: detector never managed a single valid read -- no verdict." ;;
     *) echo "ERROR: detector failed (exit $rc) -- no verdict." ;;
 esac

@@ -2,7 +2,7 @@
   <!-- Stops MSBuild from importing any Directory.Build.props found higher up the directory
        tree (e.g. when this harness is copied inside another repository such as
        dotnet/runtime, whose root props pull in the Arcade SDK): the harness is a plain
-       standalone app that builds with any .NET SDK. -->
+       standalone app that builds with any .NET SDK that targets net11.0. -->
   <PropertyGroup>
     <!-- The harness needs no source-control metadata. Skipping the query also avoids a
          build error when the clone uses a repository extension the SDK's git reader does
